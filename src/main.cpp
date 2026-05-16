@@ -11,10 +11,15 @@
 #include <mpi.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <utility>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "grid.hpp"
 #include "stencil.hpp"
@@ -51,6 +56,7 @@ void run_serial(int rows, int cols, int steps, int save_every) {
     Grid u_next(rows, cols);
     initial_hot_spot(u);
 
+    const auto t_start = std::chrono::steady_clock::now();
     for (int t = 0; t < steps; ++t) {
         if (t % save_every == 0) {
             write_frame(u, t);
@@ -59,6 +65,13 @@ void run_serial(int rows, int cols, int steps, int save_every) {
         std::swap(u, u_next);
     }
     write_frame(u, steps);
+    const auto t_end = std::chrono::steady_clock::now();
+
+    const double elapsed_s =
+        std::chrono::duration<double>(t_end - t_start).count();
+    const double cell_updates = static_cast<double>(rows) * cols * steps;
+    std::printf("elapsed: %.3fs, %.2e cell-updates/s\n",
+                elapsed_s, cell_updates / elapsed_s);
 }
 
 }  // namespace
@@ -76,9 +89,14 @@ int main(int argc, char** argv) {
     const int steps      = (argc > 3) ? std::atoi(argv[3]) : 500;
     const int save_every = (argc > 4) ? std::atoi(argv[4]) : 50;
 
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+#endif
+
     if (rank == 0) {
-        std::printf("StencilFlow 0.1.0: %dx%d grid, %d steps, save every %d, c = %.2f, ranks = %d\n",
-                    rows, cols, steps, save_every, kDiffusionNumber, size);
+        std::printf("StencilFlow 0.1.0: %dx%d grid, %d steps, save every %d, c = %.2f, ranks = %d, threads = %d\n",
+                    rows, cols, steps, save_every, kDiffusionNumber, size, threads);
         if (size > 1) {
             std::printf("Note: serial driver, ranks 1..%d will idle until slice 8 adds decomposition.\n",
                         size - 1);

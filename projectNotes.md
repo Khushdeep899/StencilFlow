@@ -27,6 +27,7 @@
 10. [Grid fill and PGM output (slice 4)](#10-grid-fill-and-pgm-output-slice-4)
 11. [The 5-point stencil and double-buffering (slice 5)](#11-the-5-point-stencil-and-double-buffering-slice-5)
 12. [Serial time loop and initial conditions (slice 6)](#12-serial-time-loop-and-initial-conditions-slice-6)
+13. [OpenMP on the stencil (slice 7)](#13-openmp-on-the-stencil-slice-7)
 
 ---
 
@@ -1232,6 +1233,184 @@ Slice 8 will replace this with actual work distributed across ranks.
 
 ---
 
-*Slice 7 next: OpenMP on the stencil. Teach-loop, because race
-conditions and the fork-join model are exactly what an interviewer
-will probe.*
+## 13. OpenMP on the stencil (slice 7)
+
+**TL;DR:** Added one `#pragma omp parallel for collapse(2)` line to
+the stencil interior loops. Tests still pass bit-identically; the
+solver is **2.76x** faster at 4 threads on Apple Silicon.
+
+### The fork-join model
+
+When the compiler sees `#pragma omp parallel for`, it generates code
+that:
+
+1. **Forks** N threads at loop entry (N defaults to physical cores,
+   overridable via `OMP_NUM_THREADS`).
+2. **Splits** loop iterations across the threads.
+3. **Joins** at the closing brace (every thread waits at an implicit
+   barrier).
+
+The threads share the parent process's memory. No message passing,
+no copies, just multiple stacks reading from and writing into the
+same heap.
+
+### MPI vs OpenMP, the canonical contrast
+
+| | MPI | OpenMP |
+|---|---|---|
+| Unit | Process | Thread |
+| Memory | Separate per process | Shared within process |
+| Communication | Explicit messages | Shared variables |
+| Scope | Across nodes and cores | Within one process |
+| Cost | High setup (network) | Low (no network) |
+
+**Hybrid (MPI + OpenMP)** means each MPI rank is itself a
+multi-threaded process. MPI handles cross-node parallelism; OpenMP
+handles within-node parallelism. That is the architecture this
+project demonstrates.
+
+### Why our stencil has no race condition
+
+```cpp
+out(i, j) = c1 * in(i, j) + c2 * (in(i-1,j) + in(i+1,j) + in(i,j-1) + in(i,j+1));
+```
+
+* `in` is **read-only** in this step. Many threads can read the same
+  cell, no problem.
+* `out(i, j)` is written by **exactly one thread** for each `(i, j)`,
+  because every iteration of the doubled loop corresponds to a unique
+  cell.
+
+**No two threads ever target the same `out(i, j)`. No race condition.
+No `#pragma omp atomic`, no mutex, no synchronization needed.**
+
+This is **why double-buffering pays off twice**: once for correctness
+across timesteps, once for free parallelism within a step. If we did
+naive in-place updates, OpenMP would produce non-deterministic
+garbage because thread 0 might overwrite a cell that thread 1 was
+about to read.
+
+### `collapse(2)` and why we need it
+
+Without `collapse`, only the outer `i` loop is parallelized. A
+256x256 grid gives 254 outer iterations to share, fine for 8
+threads. But a 16x256 grid gives only 14 outer iterations: two
+threads run twice, six run once, no balance.
+
+`collapse(2)` fuses the two loops into one virtual range of
+`(rows - 2) * (cols - 2)` iterations. Suddenly even a tall-and-skinny
+grid has thousands of iterations to share.
+
+**Cost:** the inner loop iteration variable becomes unavailable for
+thread-private bookkeeping, and auto-vectorization gets slightly
+harder. For our stencil shape it is the right trade-off.
+
+### The OpenMP loop-form restriction
+
+This C++17 idiom is unsigned-safe and elegant:
+
+```cpp
+for (std::size_t i = 1; i + 1 < rows; ++i) { ... }
+```
+
+**OpenMP rejects it.** The OpenMP spec requires the loop condition to
+be a direct comparison `var op limit` where `op` is `<`, `<=`, `>`,
+`>=`, `!=`, and `limit` does not depend on `var`. So we must
+**precompute the bound**:
+
+```cpp
+const std::size_t i_end = (rows >= 2) ? rows - 1 : 1;
+#pragma omp parallel for collapse(2)
+for (std::size_t i = 1; i < i_end; ++i) { ... }
+```
+
+The ternary keeps it unsigned-safe: if `rows < 2`, `i_end = 1`, the
+loop does not execute. **Memorize this gotcha.** It is one of the
+top OpenMP newbie traps.
+
+### CMake hint for Apple's libomp
+
+Apple's clang knows the `#pragma omp` syntax but does not ship the
+OpenMP runtime. Homebrew installs `libomp` as a **keg-only** formula,
+meaning the headers and library are not symlinked into
+`/opt/homebrew/include` and `/opt/homebrew/lib`. CMake's `FindOpenMP`
+module cannot find them on its own.
+
+The hint:
+
+```cmake
+if(APPLE AND EXISTS "/opt/homebrew/opt/libomp")
+    set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include")
+    set(OpenMP_CXX_LIB_NAMES "omp")
+    set(OpenMP_omp_LIBRARY "/opt/homebrew/opt/libomp/lib/libomp.dylib")
+endif()
+find_package(OpenMP REQUIRED)
+```
+
+* `-Xpreprocessor -fopenmp` tells Apple clang's **preprocessor** to
+  recognize `#pragma omp`. Apple stripped `-fopenmp` from the
+  compiler-driver layer because it ships no runtime; the
+  `-Xpreprocessor` form passes it through anyway.
+* The include and library paths point at the keg-only install.
+
+On Linux this entire block is skipped because `APPLE` is false.
+Linux's `find_package(OpenMP)` finds GCC's built-in OpenMP support
+automatically.
+
+### Observed scaling on Apple Silicon
+
+512x512 grid, 500 steps:
+
+| Threads | Time | Speedup |
+| --- | --- | --- |
+| 1 | 0.240 s | 1.00x |
+| 2 | 0.132 s | **1.82x** |
+| 4 | 0.087 s | **2.76x** |
+| 8 | 0.089 s | 2.70x (plateau) |
+
+Two stories explain the plateau, **both worth saying out loud**:
+
+1. **Heterogeneous cores.** Apple Silicon has 4 performance cores
+   and 4 efficiency cores. Once threads exhaust the perf cores,
+   scheduling onto efficiency cores adds work but barely adds
+   throughput.
+2. **Memory bandwidth saturation.** Stencil codes have low
+   arithmetic intensity (5 reads, 1 write per cell, only ~10 FLOPs
+   of arithmetic). Once enough threads are reading the grid, the
+   memory bus is full and adding more threads cannot help.
+
+This is **the classic stencil-scaling discussion** and exactly the
+kind of trade-off CMG cares about.
+
+### Possible interview Q&A
+
+* **Q:** Why does your code have no race condition even though
+  multiple threads run the stencil concurrently?
+* **A:** Each iteration writes to a unique `out(i, j)`, and `in` is
+  read-only this step. No two threads ever target the same memory
+  location, so there is no race. The double-buffered design is
+  what makes parallelization safe by construction.
+* **Q:** What does `collapse(2)` do?
+* **A:** It tells OpenMP to treat the two nested loops as one fused
+  iteration space of size `(rows - 2) * (cols - 2)`. Without
+  collapse, only the outer loop is divided across threads, which
+  load-balances poorly on tall-and-skinny grids. With collapse,
+  there are always plenty of iterations to share.
+* **Q:** Why does the speedup plateau at 4 threads on your Mac?
+* **A:** Two reasons. Apple Silicon mixes performance and efficiency
+  cores; once we exhaust the 4 perf cores, adding efficiency cores
+  doesn't add much. Stencil codes are also memory-bound: low
+  arithmetic intensity means we saturate memory bandwidth before
+  we saturate compute.
+* **Q:** What is the difference between MPI and OpenMP?
+* **A:** MPI is multi-process with explicit message passing,
+  designed for cross-node parallelism. OpenMP is multi-thread within
+  a process, sharing memory, for within-node parallelism. Hybrid
+  programs use MPI between nodes and OpenMP inside each rank,
+  matching the hardware hierarchy.
+
+---
+
+*Slice 8 next: MPI 1D domain decomposition. Each rank allocates only
+its slab. Teach-loop. Then slice 9 wires up `MPI_Sendrecv` halos
+which is the hardest single thing in the project.*

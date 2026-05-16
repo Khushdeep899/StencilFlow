@@ -37,13 +37,23 @@ endif()
 
 find_package(MPI REQUIRED)
 
+# OpenMP. Apple clang does not ship libomp; it lives in Homebrew as a
+# keg-only formula. Hint FindOpenMP at /opt/homebrew/opt/libomp before
+# calling find_package so the search succeeds without manual env vars.
+if(APPLE AND EXISTS "/opt/homebrew/opt/libomp")
+    set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include")
+    set(OpenMP_CXX_LIB_NAMES "omp")
+    set(OpenMP_omp_LIBRARY "/opt/homebrew/opt/libomp/lib/libomp.dylib")
+endif()
+find_package(OpenMP REQUIRED)
+
 add_executable(stencilflow
     src/main.cpp
     src/grid.cpp
     src/stencil.cpp
 )
 
-target_link_libraries(stencilflow PRIVATE MPI::MPI_CXX)
+target_link_libraries(stencilflow PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)
 
 # Tests. FetchContent downloads a pinned GoogleTest at configure time so
 # we never depend on a system-installed gtest, which makes CI Docker

@@ -24,6 +24,7 @@ target_include_directories(grid_tests PRIVATE
 # "duplicate library" warning from Apple's linker.
 target_link_libraries(grid_tests PRIVATE
     GTest::gtest_main
+    OpenMP::OpenMP_CXX
 )
 
 # gtest_discover_tests scans the binary at build time and registers each
