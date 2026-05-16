@@ -31,6 +31,7 @@
 14. [MPI 1D domain decomposition (slice 8)](#14-mpi-1d-domain-decomposition-slice-8)
 15. [MPI_Sendrecv halo exchange (slice 9)](#15-mpi_sendrecv-halo-exchange-slice-9)
 16. [MPI_Gatherv and intermediate frames (slice 10)](#16-mpi_gatherv-and-intermediate-frames-slice-10)
+17. [Hybrid vs serial byte-identical validation (slice 11)](#17-hybrid-vs-serial-byte-identical-validation-slice-11)
 
 ---
 
@@ -1830,7 +1831,78 @@ in the README is a good "future work" note.
 
 ---
 
-*Slice 11 next: an automated hybrid-vs-serial validation test
-asserting hybrid output equals serial output to within floating
-point tolerance. Short teach-loop slice because the methodology
-matters more than the code.*
+## 17. Hybrid vs serial byte-identical validation (slice 11)
+
+**TL;DR:** `benchmarks/validate.sh` runs the solver under
+`mpirun -n 1` and `mpirun -n 4` on the same problem, then `cmp`s
+the resulting PGMs. They are **byte-identical**. This is the
+strongest possible correctness check: not "within tolerance" but
+bit-for-bit.
+
+### Why byte-identical is achievable here
+
+A common assumption is that any change in parallelization
+introduces floating-point drift. In our case it does not, for
+three reasons:
+
+1. **OpenMP order-independence.** Each iteration of the parallel
+   stencil loop writes to a unique `out(i, j)`. The write order
+   does not affect the result. (Reductions or accumulators would
+   be a different story.)
+2. **MPI is byte-exact.** `MPI_Sendrecv` copies bytes between
+   ranks without transformation. The halo row that arrives at the
+   recv side is identical to what was sent.
+3. **PGM normalization is deterministic.** The min and max scan
+   over the grid produces the same values given the same input,
+   regardless of rank count.
+
+So if the math is right, the bytes match. **Any difference is a
+bug.**
+
+### Why this matters for the interview
+
+Stating "my hybrid solver matches serial output to within tolerance"
+is OK. Stating "my hybrid solver produces byte-identical output to
+serial, demonstrated by `cmp` in CI" is **stronger and harder to
+argue with.** It is also a marker of code that does not silently
+accumulate error.
+
+CMG's production code uses iterative solvers (CG, GMRES) that are
+**not** byte-identical in parallel (the partial-sum order in dot
+products matters). They use tolerance-based validation. Knowing the
+difference between "my code is byte-identical" and "real solvers
+need tolerance" is interview-relevant context.
+
+### The validation script in three lines
+
+```bash
+mpirun -n 1 ./stencilflow 128 128 200 100000   # saves only the final frame
+mpirun -n 4 ./stencilflow 128 128 200 100000
+cmp frames_serial/...final.pgm frames_hybrid/...final.pgm    # PASS = exit 0
+```
+
+### Possible interview Q&A
+
+* **Q:** How do you validate that the parallel version is correct?
+* **A:** `benchmarks/validate.sh` runs the solver in serial (`-n 1`)
+  and hybrid (`-n 4`) modes on the same problem and `cmp`s the
+  resulting PGM frames. They are byte-identical, which is the
+  strongest correctness statement: not just within tolerance but
+  bit-for-bit. This works because our stencil has order-independent
+  writes, `MPI_Sendrecv` is byte-exact, and PGM normalization is
+  deterministic.
+* **Q:** Real production solvers (CG, GMRES) cannot guarantee
+  byte-identical parallel output. Why?
+* **A:** Those solvers use dot products and other reductions whose
+  result depends on summation order. With parallel reduction the
+  partial-sum order varies with rank count, so floating-point
+  rounding differs by ULPs. Validation for those codes is
+  tolerance-based ("max element-wise error < epsilon") rather than
+  bit-equality. Knowing this distinction lets you reason about which
+  correctness claim applies to which algorithm.
+
+---
+
+*Slice 12 next: scaling benchmark scripts (strong + weak) and
+matplotlib plots. Ship-first. The two plots are the visual headline
+of the README.*
