@@ -8,6 +8,7 @@ out/
 # not the raw frames the solver dumps.
 *.pgm
 *.csv
+frames/
 !benchmarks/expected/*.csv
 
 # Compiled objects and binaries

@@ -26,6 +26,7 @@
 9. [Indexing operator with const overloads, real TDD (slice 3)](#9-indexing-operator-with-const-overloads-real-tdd-slice-3)
 10. [Grid fill and PGM output (slice 4)](#10-grid-fill-and-pgm-output-slice-4)
 11. [The 5-point stencil and double-buffering (slice 5)](#11-the-5-point-stencil-and-double-buffering-slice-5)
+12. [Serial time loop and initial conditions (slice 6)](#12-serial-time-loop-and-initial-conditions-slice-6)
 
 ---
 
@@ -1156,6 +1157,81 @@ in parallel across MPI ranks with halo exchange between them.
 
 ---
 
-*Slice 6 next: wire `step()` into a real time loop inside main.cpp
-with initial hot-spot conditions, then verify visually by writing
-PGM frames. Shipped ship-first.*
+## 12. Serial time loop and initial conditions (slice 6)
+
+**TL;DR:** `main.cpp` is now a real serial driver. Initial condition
+is a hot square at the center of the grid; the loop calls `step()`,
+swaps the two buffers, and writes a PGM frame every N steps into
+`frames/`. MPI is initialized but only rank 0 does work; the full
+decomposition lands in slice 8.
+
+### The loop
+
+```cpp
+for (int t = 0; t < steps; ++t) {
+    if (t % save_every == 0) {
+        write_frame(u, t);
+    }
+    step(u, u_next, c);
+    std::swap(u, u_next);
+}
+write_frame(u, steps);   // final
+```
+
+### Topics that landed
+
+* **`std::swap` on `Grid`.** This is a free function in `<utility>`
+  that exchanges two objects. Under the hood it uses **move
+  semantics**: it does not copy the underlying vectors, it swaps the
+  three pointers each vector holds internally. **Cost is O(1) per
+  swap**, no matter how big the grid. This is what makes
+  double-buffering practical for large simulations.
+* **Anonymous namespace** (`namespace { ... }`). Everything inside
+  has **internal linkage**, meaning it is visible only within this
+  translation unit. The modern C++ replacement for `static` at file
+  scope. Used here for helper functions like `initial_hot_spot` and
+  `write_frame` that are not part of any public API.
+* **`constexpr double kDiffusionNumber = 0.2;`** A compile-time
+  constant. `constexpr` is stricter than `const`: it guarantees the
+  value can be computed at compile time, so the compiler can inline
+  it everywhere. Naming convention `k` prefix is Google style for
+  constants.
+* **`std::filesystem::create_directories("frames")`** creates the
+  directory if it does not exist, no error if it already does.
+  Cross-platform; C++17 standard.
+* **`std::atoi`** is the simplest possible string-to-int. It returns
+  0 on parse failure with no error reporting. **For a real CLI we
+  would use `std::stoi` (throws on failure) or a proper parser like
+  CLI11.** Here we trade safety for brevity.
+
+### The "rank 0 only" pattern
+
+```cpp
+if (rank == 0) {
+    run_serial(...);
+}
+MPI_Finalize();
+```
+
+Common idiom for **single-writer** tasks (reading config, writing
+output) inside an MPI program. Other ranks idle until `MPI_Finalize`.
+Slice 8 will replace this with actual work distributed across ranks.
+
+### Possible interview Q&A
+
+* **Q:** Why `std::swap(u, u_next)` instead of `u = u_next`?
+* **A:** `std::swap` is O(1) move; it exchanges the two vectors'
+  internal pointers. Copy assignment would do an O(N) memcpy of every
+  cell, which is unacceptable in a hot loop. Swapping also leaves
+  `u_next` as a scratch buffer for the next iteration, no allocation
+  needed.
+* **Q:** Why an anonymous namespace?
+* **A:** To give helper functions internal linkage so they do not
+  pollute the global symbol table. Replaces the C-era `static` at
+  file scope; modern C++ idiom.
+
+---
+
+*Slice 7 next: OpenMP on the stencil. Teach-loop, because race
+conditions and the fork-join model are exactly what an interviewer
+will probe.*
