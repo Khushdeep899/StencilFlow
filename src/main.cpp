@@ -1,10 +1,10 @@
 // StencilFlow: hybrid MPI + OpenMP 2D heat equation solver.
 //
-// Slice 8: each rank allocates only its horizontal strip of the
-// global grid (plus one halo row above and below if a neighbor
-// exists in that direction). The time loop runs step() on each
-// rank's local buffer. Halos are still zero this slice; slice 9
-// will fill them via MPI_Sendrecv each timestep.
+// Slice 11: each rank holds only its strip plus halos. The time
+// loop is:
+//   exchange_halos -> step -> swap.
+// Every save_every iterations, MPI_Gatherv collects all owned rows
+// to rank 0 which writes one combined PGM frame.
 
 #include <mpi.h>
 
@@ -12,7 +12,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <utility>
+#include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -27,9 +29,6 @@ namespace {
 
 constexpr double kDiffusionNumber = 0.2;
 
-// Initialize the local grid so the global hot spot is reproduced on
-// the owned portion of each rank. Halo rows are left at zero; they
-// will be overwritten by MPI exchange in slice 9.
 void initial_hot_spot_local(Grid& u_local,
                             const Decomposition& d,
                             std::size_t total_rows,
@@ -52,26 +51,57 @@ void initial_hot_spot_local(Grid& u_local,
     }
 }
 
-// Scan only the owned rows for min and max so halo-driven zeros do
-// not contaminate the report.
-std::pair<double, double> owned_min_max(const Grid& u,
-                                        const Decomposition& d) {
-    double lo = +1e308;
-    double hi = -1e308;
-    const std::size_t owned_start = d.local_owned_start();
-    for (std::size_t k = 0; k < d.num_rows; ++k) {
-        for (std::size_t j = 0; j < u.cols(); ++j) {
-            const double v = u(owned_start + k, j);
-            if (v < lo) lo = v;
-            if (v > hi) hi = v;
+// Collect every rank's owned rows onto rank 0 with MPI_Gatherv.
+// Returns a fully populated Grid on rank 0; on other ranks the
+// returned Grid is empty (0 rows). MPI_Gatherv is needed (not the
+// simpler MPI_Gather) because per-rank slab sizes can differ by 1
+// when total_rows is not divisible by size.
+Grid gather_to_root(const Grid& u_local,
+                    const Decomposition& d,
+                    std::size_t total_rows,
+                    std::size_t total_cols,
+                    int rank,
+                    int size) {
+    Grid global = (rank == 0) ? Grid(total_rows, total_cols) : Grid(0, 0);
+
+    const double* send_buf = &u_local(d.local_owned_start(), 0);
+    const int send_count   = static_cast<int>(d.num_rows * total_cols);
+
+    std::vector<int> recvcounts;
+    std::vector<int> displs;
+    if (rank == 0) {
+        recvcounts.resize(static_cast<std::size_t>(size));
+        displs.resize(static_cast<std::size_t>(size));
+        for (int r = 0; r < size; ++r) {
+            const Decomposition dr = decompose(total_rows, r, size);
+            recvcounts[static_cast<std::size_t>(r)] =
+                static_cast<int>(dr.num_rows * total_cols);
+            displs[static_cast<std::size_t>(r)] =
+                static_cast<int>(dr.start_row * total_cols);
         }
     }
-    return {lo, hi};
+
+    MPI_Gatherv(send_buf, send_count, MPI_DOUBLE,
+                global.data(),
+                rank == 0 ? recvcounts.data() : nullptr,
+                rank == 0 ? displs.data()     : nullptr,
+                MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    return global;
+}
+
+void write_global_frame(const Grid& global, int t) {
+    char fname[64];
+    std::snprintf(fname, sizeof(fname), "frames/frame_%05d.pgm", t);
+    global.write_pgm(fname);
+    std::printf("  step %d -> %s\n", t, fname);
+    std::fflush(stdout);
 }
 
 void run_hybrid(std::size_t total_rows,
                 std::size_t total_cols,
                 int steps,
+                int save_every,
                 int rank,
                 int size) {
     const Decomposition d = decompose(total_rows, rank, size);
@@ -80,38 +110,46 @@ void run_hybrid(std::size_t total_rows,
     Grid u_local_next(d.local_rows_with_halo(), total_cols);
     initial_hot_spot_local(u_local, d, total_rows, total_cols);
 
-    // Rank-by-rank decomposition print, serialized so the lines do
-    // not interleave on the terminal.
     for (int r = 0; r < size; ++r) {
         if (r == rank) {
-            std::printf("  rank %d: owns rows [%zu, %zu), local buffer %zu x %zu (halo top=%d bottom=%d)\n",
+            std::printf("  rank %d: owns rows [%zu, %zu), local buffer %zu x %zu\n",
                         rank, d.start_row, d.start_row + d.num_rows,
-                        d.local_rows_with_halo(), total_cols,
-                        d.has_north ? 1 : 0, d.has_south ? 1 : 0);
+                        d.local_rows_with_halo(), total_cols);
             std::fflush(stdout);
         }
         MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    if (rank == 0) {
+        std::filesystem::create_directories("frames");
     }
 
     const auto t_start = std::chrono::steady_clock::now();
     for (int t = 0; t < steps; ++t) {
+        if (t % save_every == 0) {
+            Grid global = gather_to_root(u_local, d, total_rows, total_cols, rank, size);
+            if (rank == 0) write_global_frame(global, t);
+        }
         exchange_halos(u_local, d);
         step(u_local, u_local_next, kDiffusionNumber);
         std::swap(u_local, u_local_next);
     }
-    const auto t_end = std::chrono::steady_clock::now();
 
+    // Final frame at t == steps.
+    {
+        Grid global = gather_to_root(u_local, d, total_rows, total_cols, rank, size);
+        if (rank == 0) write_global_frame(global, steps);
+    }
+
+    const auto t_end = std::chrono::steady_clock::now();
     const double elapsed_s =
         std::chrono::duration<double>(t_end - t_start).count();
 
-    auto [lo, hi] = owned_min_max(u_local, d);
-    for (int r = 0; r < size; ++r) {
-        if (r == rank) {
-            std::printf("  rank %d: owned min=%.4f max=%.4f, elapsed %.3fs\n",
-                        rank, lo, hi, elapsed_s);
-            std::fflush(stdout);
-        }
-        MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) {
+        const double cell_updates =
+            static_cast<double>(total_rows) * total_cols * steps;
+        std::printf("elapsed: %.3fs, %.2e cell-updates/s\n",
+                    elapsed_s, cell_updates / elapsed_s);
     }
 }
 
@@ -128,6 +166,7 @@ int main(int argc, char** argv) {
     const std::size_t rows  = (argc > 1) ? static_cast<std::size_t>(std::atoi(argv[1])) : 256u;
     const std::size_t cols  = (argc > 2) ? static_cast<std::size_t>(std::atoi(argv[2])) : 256u;
     const int steps         = (argc > 3) ? std::atoi(argv[3]) : 500;
+    const int save_every    = (argc > 4) ? std::atoi(argv[4]) : 100;
 
     int threads = 1;
 #ifdef _OPENMP
@@ -135,13 +174,13 @@ int main(int argc, char** argv) {
 #endif
 
     if (rank == 0) {
-        std::printf("StencilFlow 0.1.0: %zux%zu grid, %d steps, c = %.2f, ranks = %d, threads/rank = %d\n",
-                    rows, cols, steps, kDiffusionNumber, size, threads);
+        std::printf("StencilFlow 0.1.0: %zux%zu grid, %d steps, save every %d, c = %.2f, ranks = %d, threads/rank = %d\n",
+                    rows, cols, steps, save_every, kDiffusionNumber, size, threads);
         std::fflush(stdout);
     }
     MPI_Barrier(MPI_COMM_WORLD);
 
-    run_hybrid(rows, cols, steps, rank, size);
+    run_hybrid(rows, cols, steps, save_every, rank, size);
 
     MPI_Finalize();
     return 0;

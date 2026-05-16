@@ -30,6 +30,7 @@
 13. [OpenMP on the stencil (slice 7)](#13-openmp-on-the-stencil-slice-7)
 14. [MPI 1D domain decomposition (slice 8)](#14-mpi-1d-domain-decomposition-slice-8)
 15. [MPI_Sendrecv halo exchange (slice 9)](#15-mpi_sendrecv-halo-exchange-slice-9)
+16. [MPI_Gatherv and intermediate frames (slice 10)](#16-mpi_gatherv-and-intermediate-frames-slice-10)
 
 ---
 
@@ -1738,7 +1739,98 @@ the entire grid for the polished portfolio result.
 
 ---
 
-*Slice 10 next: an automated hybrid-vs-serial validation test that
-runs both modes and asserts the outputs match to within floating
-point tolerance. Short slice, teach-loop because the validation
-methodology itself is worth understanding.*
+## 16. MPI_Gatherv and intermediate frames (slice 10)
+
+**TL;DR:** Every save_every steps, `MPI_Gatherv` collects each
+rank's owned rows onto rank 0, which then writes one combined PGM
+frame. Use **Gatherv** (not Gather) because slab sizes can differ
+by 1 when `rows % size != 0`.
+
+### MPI_Gather vs MPI_Gatherv
+
+| | `MPI_Gather` | `MPI_Gatherv` |
+|---|---|---|
+| Per-rank send count | All ranks must send the same | Different counts allowed |
+| Receive layout on root | Concatenated, equal-sized | Variable, defined by `displs` |
+| Use when | Even split (rows % size == 0) | Uneven split (general case) |
+
+Our decomposition handed the first `rows % size` ranks one extra
+row to balance work. That means slab sizes vary by 1, so we need
+**Gatherv**.
+
+### The two extra arrays root needs
+
+```cpp
+std::vector<int> recvcounts(size);  // bytes/elements rank r sends
+std::vector<int> displs(size);       // where rank r's data lands in recv_buf
+
+for (int r = 0; r < size; ++r) {
+    Decomposition dr = decompose(total_rows, r, size);
+    recvcounts[r] = dr.num_rows * total_cols;
+    displs[r]     = dr.start_row * total_cols;
+}
+```
+
+* **`recvcounts[r]`**: how many doubles rank `r` will send.
+* **`displs[r]`**: the offset (in doubles) into the receive buffer
+  where rank `r`'s data begins. Equivalent to "global row index of
+  rank `r`'s first owned row times cols."
+
+These arrays are only used by the root rank. Non-root ranks pass
+`nullptr` for them, which the runtime ignores.
+
+### The "rank 0 holds the full picture" pattern
+
+After `MPI_Gatherv`, rank 0 has the **full global grid** in memory.
+Other ranks still hold only their slabs. **Rank 0 is the single
+writer to disk.** This is the canonical pattern when the output
+medium is sequential (a single PGM file).
+
+### Trade-offs of gather-and-write
+
+* **Pro:** simple, no MPI-IO complexity, deterministic single
+  writer.
+* **Con:** rank 0 must hold the full grid in memory. On a
+  `1M x 1M` grid (8 TB), that fails. Real production code uses
+  **parallel I/O** (`MPI_File_write_at`) so every rank writes its
+  own slab into a shared file, no gather needed.
+* **Con:** gather is a synchronization point. All ranks pause and
+  send to rank 0. Doing this every step would be expensive; doing
+  it every 50-100 steps is fine.
+
+For our portfolio scale (up to a few thousand on a side), gather is
+the right answer. Calling out **the next step would be parallel I/O**
+in the README is a good "future work" note.
+
+### Topics that landed
+
+* **`MPI_Gatherv`** with `recvcounts` and `displs` arrays.
+* **The send-recv asymmetry**: every rank sends, only root receives.
+  Non-root ranks pass `nullptr` for the recv-side arguments.
+* **`std::vector` resized only on root**: non-root ranks have empty
+  vectors and never call `.data()` on them, avoiding the
+  empty-vector edge case.
+
+### Possible interview Q&A
+
+* **Q:** Why MPI_Gatherv instead of MPI_Gather?
+* **A:** Our decomposition gives the first `rows % size` ranks one
+  extra row, so slab sizes can differ by 1. `MPI_Gather` requires
+  every rank send the same count; `MPI_Gatherv` accepts per-rank
+  counts and displacements. The 'v' stands for "vector" in the
+  sense of "varying."
+* **Q:** What is the downside of gather-and-write?
+* **A:** Rank 0 must hold the full grid in memory. For very large
+  problems this becomes the memory bottleneck. Production code
+  would use MPI-IO (`MPI_File_write_at`) where every rank writes
+  its own slab directly into a shared file in parallel, no gather
+  needed. For our scale (up to a few thousand cells per side) the
+  gather-and-write pattern is the right trade-off between
+  simplicity and performance.
+
+---
+
+*Slice 11 next: an automated hybrid-vs-serial validation test
+asserting hybrid output equals serial output to within floating
+point tolerance. Short teach-loop slice because the methodology
+matters more than the code.*
