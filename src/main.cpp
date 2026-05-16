@@ -20,6 +20,7 @@
 
 #include "decomp.hpp"
 #include "grid.hpp"
+#include "halo.hpp"
 #include "stencil.hpp"
 
 namespace {
@@ -94,7 +95,7 @@ void run_hybrid(std::size_t total_rows,
 
     const auto t_start = std::chrono::steady_clock::now();
     for (int t = 0; t < steps; ++t) {
-        // TODO(slice 9): MPI_Sendrecv halo exchange goes here.
+        exchange_halos(u_local, d);
         step(u_local, u_local_next, kDiffusionNumber);
         std::swap(u_local, u_local_next);
     }
@@ -136,7 +137,6 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         std::printf("StencilFlow 0.1.0: %zux%zu grid, %d steps, c = %.2f, ranks = %d, threads/rank = %d\n",
                     rows, cols, steps, kDiffusionNumber, size, threads);
-        std::printf("Note: halos still zero in slice 8; inter-rank boundary values are wrong until slice 9 adds MPI_Sendrecv.\n");
         std::fflush(stdout);
     }
     MPI_Barrier(MPI_COMM_WORLD);

@@ -29,6 +29,7 @@
 12. [Serial time loop and initial conditions (slice 6)](#12-serial-time-loop-and-initial-conditions-slice-6)
 13. [OpenMP on the stencil (slice 7)](#13-openmp-on-the-stencil-slice-7)
 14. [MPI 1D domain decomposition (slice 8)](#14-mpi-1d-domain-decomposition-slice-8)
+15. [MPI_Sendrecv halo exchange (slice 9)](#15-mpi_sendrecv-halo-exchange-slice-9)
 
 ---
 
@@ -1588,6 +1589,156 @@ actual data before each step.
 
 ---
 
-*Slice 9 next: `MPI_Sendrecv` halo exchange. The hardest single
-piece of the project. Teach-loop, very carefully, with the deadlock
-argument front and center.*
+## 15. MPI_Sendrecv halo exchange (slice 9)
+
+**TL;DR:** Each rank exchanges its top and bottom owned rows with
+the corresponding neighbor halos via two `MPI_Sendrecv` calls per
+timestep. The single line that fixes everything:
+
+```cpp
+MPI_Sendrecv(send_buf, count, MPI_DOUBLE, dest,   tag,
+             recv_buf, count, MPI_DOUBLE, source, tag,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+```
+
+**This is the most important slice in the project. The interviewer
+will probe this.**
+
+### Why naive `MPI_Send` + `MPI_Recv` can deadlock
+
+```cpp
+MPI_Send(my_top_row,  cols, MPI_DOUBLE, north_rank, tag, MPI_COMM_WORLD);
+MPI_Recv(my_top_halo, cols, MPI_DOUBLE, north_rank, tag, MPI_COMM_WORLD, ...);
+```
+
+Looks innocent. **Can deadlock.** Here is the mechanism.
+
+MPI sends have two underlying transport modes:
+
+* **Eager mode** (small messages): the sender ships bytes into a
+  pre-allocated buffer at the receiver and returns immediately.
+  No coordination needed.
+* **Rendezvous mode** (large messages): the sender stalls until
+  the receiver has posted a matching `MPI_Recv`, because the
+  runtime needs the receiver's buffer address before copying.
+
+The size threshold is implementation-defined (often 16 KB to 128
+KB). On a small grid you get eager mode and the code works. On a
+4096x4096 grid where `cols * 8 bytes > eager threshold` you get
+rendezvous, and **every rank stalls on `MPI_Send` waiting for the
+neighbor's `MPI_Recv`, but the neighbor is also stalled on its own
+`MPI_Send`.**
+
+The bug never appears in development and **explodes the first time
+you scale up**. This is a classic distributed-systems hazard.
+
+### How `MPI_Sendrecv` fixes it
+
+`MPI_Sendrecv` does both directions in one atomic call. The MPI
+runtime sees the send **and** the receive together, so it can
+arrange the pairing with the peer's matching call **without anybody
+stalling indefinitely**. **Use it.** Always. For any bidirectional
+exchange between two ranks. Never write separate send + recv unless
+you have a very specific reason and have proven it cannot deadlock.
+
+### Two phases per timestep
+
+Each rank does **two** halo exchanges per step, in two phases:
+
+**Phase 1 (down direction):**
+
+```
+Send: my last owned row -> south neighbor's top halo
+Recv: my top halo       <- north neighbor's last owned row
+```
+
+**Phase 2 (up direction):**
+
+```
+Send: my first owned row -> north neighbor's bottom halo
+Recv: my bottom halo     <- south neighbor's first owned row
+```
+
+After both phases, every rank's halo rows hold the neighbor's most
+recent boundary data. Step() can then read them safely.
+
+### MPI_PROC_NULL handles edges, no branching needed
+
+Rank 0 has no north neighbor: `d.north_rank == MPI_PROC_NULL`.
+When `MPI_Sendrecv`'s source or dest is `MPI_PROC_NULL`, the call
+is a **no-op**. The buffer is not accessed. **The same line of code
+runs for interior and edge ranks; no `if (has_north)` branching.**
+
+### Why two distinct tags
+
+Phase 1 uses tag `kTagDown = 0`; Phase 2 uses tag `kTagUp = 1`.
+**Without distinct tags**, the runtime could in principle match a
+phase-1 send from rank A with a phase-2 receive from rank B if ranks
+get out of phase. Tags partition the message namespace so the matches
+are unambiguous. The cost is one integer per call; the safety is
+worth it.
+
+### The result: serial answer restored bit-for-bit
+
+`mpirun -n 1 ./stencilflow 128 128 100`: rank 0 max = **90.6500**.
+
+`mpirun -n 4 ./stencilflow 128 128 100`: rank 2 max = **90.6500**.
+
+(rank 2 owns the global hot-spot center row, so its max is the
+serial max.) **Halo exchange restored bit-for-bit correctness at
+the inter-rank boundary.** Slice 10 will automate this check across
+the entire grid for the polished portfolio result.
+
+### Topics that landed
+
+* **`MPI_Sendrecv`** as the canonical deadlock-free bidirectional
+  exchange.
+* **Eager vs rendezvous send modes**, and why the deadlock only
+  appears at scale.
+* **Tags** for partitioning the message namespace.
+* **`MPI_PROC_NULL`** doing the right thing automatically.
+* **Why halo exchange comes before step() in the time loop**: the
+  step reads halos that must be fresh; if exchange ran after step,
+  the next step would see stale boundary data.
+
+### Possible interview Q&A
+
+* **Q:** Why do you use `MPI_Sendrecv` instead of `MPI_Send` followed
+  by `MPI_Recv`?
+* **A:** The naive pair can deadlock when messages exceed the MPI
+  runtime's eager-send threshold. In rendezvous mode, every rank
+  stalls on send waiting for the receiver to post recv, but the
+  receiver is also stalled on its own send. The bug never appears
+  in development and only triggers at scale, which is the worst
+  possible failure mode. `MPI_Sendrecv` atomically posts both the
+  send and the receive in one call, letting the runtime pair them
+  with the peer without indefinite stalling.
+* **Q:** Why two `MPI_Sendrecv` calls per timestep, not one?
+* **A:** Each call handles one direction (down or up). You need
+  both because the stencil reads both the row above and the row
+  below. You could combine into a single more complex
+  communicator-collectives pattern with `MPI_Cart_shift`, but two
+  Sendrecv calls is the clearest expression of the data flow.
+* **Q:** Why distinct tags for the two phases?
+* **A:** To prevent the runtime from matching a down-direction send
+  with an up-direction receive when ranks are out of phase. The
+  tag namespace is cheap; the safety is meaningful.
+* **Q:** Why does `MPI_PROC_NULL` simplify the edge-rank case?
+* **A:** Passing it as a source or destination makes the
+  corresponding direction of `MPI_Sendrecv` a no-op. So rank 0
+  (no north neighbor) and rank N-1 (no south neighbor) call the
+  exact same code as interior ranks. No `if (has_north)` branches,
+  cleaner code, fewer paths to test.
+* **Q:** Where in the timestep loop does halo exchange go, before
+  or after `step()`?
+* **A:** Before. The step reads halo data, so halos must be fresh
+  when step runs. Exchanging after step would mean each step sees
+  stale data from the previous iteration's boundary. The pattern
+  is: exchange, step, swap, repeat.
+
+---
+
+*Slice 10 next: an automated hybrid-vs-serial validation test that
+runs both modes and asserts the outputs match to within floating
+point tolerance. Short slice, teach-loop because the validation
+methodology itself is worth understanding.*
