@@ -5,8 +5,10 @@
 add_executable(grid_tests
     test_grid.cpp
     test_stencil.cpp
+    test_decomp.cpp
     ${CMAKE_SOURCE_DIR}/src/grid.cpp
     ${CMAKE_SOURCE_DIR}/src/stencil.cpp
+    ${CMAKE_SOURCE_DIR}/src/decomp.cpp
 )
 
 # Grid is currently a header-only class, so we only need its include path,
@@ -25,6 +27,7 @@ target_include_directories(grid_tests PRIVATE
 target_link_libraries(grid_tests PRIVATE
     GTest::gtest_main
     OpenMP::OpenMP_CXX
+    MPI::MPI_CXX
 )
 
 # gtest_discover_tests scans the binary at build time and registers each

@@ -51,6 +51,7 @@ add_executable(stencilflow
     src/main.cpp
     src/grid.cpp
     src/stencil.cpp
+    src/decomp.cpp
 )
 
 target_link_libraries(stencilflow PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)

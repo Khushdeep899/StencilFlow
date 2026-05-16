@@ -28,6 +28,7 @@
 11. [The 5-point stencil and double-buffering (slice 5)](#11-the-5-point-stencil-and-double-buffering-slice-5)
 12. [Serial time loop and initial conditions (slice 6)](#12-serial-time-loop-and-initial-conditions-slice-6)
 13. [OpenMP on the stencil (slice 7)](#13-openmp-on-the-stencil-slice-7)
+14. [MPI 1D domain decomposition (slice 8)](#14-mpi-1d-domain-decomposition-slice-8)
 
 ---
 
@@ -1411,6 +1412,182 @@ kind of trade-off CMG cares about.
 
 ---
 
-*Slice 8 next: MPI 1D domain decomposition. Each rank allocates only
-its slab. Teach-loop. Then slice 9 wires up `MPI_Sendrecv` halos
-which is the hardest single thing in the project.*
+## 14. MPI 1D domain decomposition (slice 8)
+
+**TL;DR:** Each rank now allocates only its horizontal strip of the
+global grid plus halo rows. The math runs locally per rank; halos
+stay zero until slice 9 wires up `MPI_Sendrecv`. Visible asymmetry
+at the inter-rank boundary in this slice is **the expected bug**
+that slice 9 fixes.
+
+### The picture
+
+```
+Global 128x128 grid, 4 ranks:
+
+  rank 0 owns rows [0, 32),    local buffer 33 x 128  (south halo only)
+  rank 1 owns rows [32, 64),   local buffer 34 x 128  (both halos)
+  rank 2 owns rows [64, 96),   local buffer 34 x 128  (both halos)
+  rank 3 owns rows [96, 128),  local buffer 33 x 128  (north halo only)
+```
+
+Edge ranks have one fewer halo because they sit on a global boundary
+(the global edge stays fixed by Dirichlet BC).
+
+### Why halos exist at all
+
+The 5-point stencil at the top owned row of rank 1 needs to read the
+**bottom owned row of rank 0**. That data lives in rank 0's process
+memory, which rank 1 cannot read directly because **MPI processes do
+not share memory**.
+
+The fix: rank 1 allocates **one extra row above** its owned strip.
+That extra row is filled by a message from rank 0 each timestep
+(slice 9). It is called a **halo** or **ghost cell**, because it
+mirrors a cell rank 1 does not actually own.
+
+### Memory scaling matters
+
+A serial solver on a 4096x4096 grid needs 4096*4096*8 = 128 MB for
+one Grid, 256 MB for double-buffer. Run that on a workstation, fine.
+Run on a 1 million x 1 million grid (the scale CMG cares about for
+reservoir simulation), you need 8 TB of RAM. No single machine has
+that.
+
+With domain decomposition across, say, 1000 MPI ranks, each rank
+holds only 1000 x 1 million doubles = 8 GB. **Each rank fits in
+commodity RAM.** This is the entire point of distributed-memory
+parallelism: not just speed, but **scaling memory beyond one
+machine**.
+
+### Even-as-possible decomposition arithmetic
+
+For `N` global rows across `S` ranks:
+
+```cpp
+base      = N / S;
+remainder = N % S;
+num_rows  = base + (rank < remainder ? 1 : 0);
+start_row = rank * base + min(rank, remainder);
+```
+
+The first `remainder` ranks each get one extra row. Spread of `+/- 1`
+across all ranks. For `N = 128, S = 4`: every rank gets 32 rows. For
+`N = 10, S = 3`: rank 0 gets 4, ranks 1-2 get 3.
+
+### `MPI_PROC_NULL` for edge ranks
+
+Rank 0 has no northern neighbor. Rather than branch on `if
+(has_north) MPI_Send(...);` in the halo-exchange code, MPI defines
+the constant **`MPI_PROC_NULL`**. Passing it as the destination or
+source of a send/recv makes the call a **no-op**. So the same line
+works for interior and edge ranks:
+
+```cpp
+MPI_Sendrecv(send_buf, count, MPI_DOUBLE,
+             decomp.north_rank, tag,           // MPI_PROC_NULL if edge
+             recv_buf, count, MPI_DOUBLE,
+             decomp.north_rank, tag,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+```
+
+**This is one of MPI's nicest API decisions:** instead of forcing
+the caller to branch, the library handles the sentinel.
+
+### `MPI_Barrier` for orderly output
+
+```cpp
+for (int r = 0; r < size; ++r) {
+    if (r == rank) {
+        std::printf("...");
+        std::fflush(stdout);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+```
+
+`MPI_Barrier` blocks until **every** rank has reached the call. By
+walking `r` from 0 to size-1 and only printing when `r == rank`, the
+ranks take turns. Without the barrier, all 4 ranks would `printf` in
+parallel and the lines would interleave randomly. This is a common
+trick for clean per-rank logging.
+
+In production code (which we will not write here), barriers are
+expensive: every rank stalls until the slowest catches up. Sprinkle
+them only for diagnostics, never inside the hot loop.
+
+### The "halos still zero" smoke-test result
+
+Running `mpirun -n 4 ./stencilflow 128 128 100`:
+
+```
+  rank 0: owned min=0.0000 max=0.0000
+  rank 1: owned min=0.0000 max=52.8392
+  rank 2: owned min=0.0000 max=57.6887
+  rank 3: owned min=0.0000 max=0.0000
+```
+
+* **Ranks 0 and 3** have no hot cells in their owned rows (hot spot
+  is at global row ~64). They stay at zero, correct.
+* **Ranks 1 and 2** each contain a portion of the hot spot. After
+  100 steps they show different `max` values (52.84 vs 57.69), even
+  though by symmetry they should be identical: rank 2's hot region
+  is the mirror image of rank 1's.
+
+**Why the asymmetry?** The halo between rank 1's bottom and rank 2's
+top is zero (not the actual neighbor data). When rank 1's bottom
+owned row diffuses, it leaks heat into a cold halo and loses it.
+Same for rank 2's top row. The amounts lost are not exactly equal
+because the asymmetric placement of the hot spot relative to each
+rank's strip means slightly different amounts flow into the
+respective dead halos.
+
+Slice 9 fixes this by populating the halo rows with the neighbor's
+actual data before each step.
+
+### Topics that landed
+
+* **`MPI_PROC_NULL`** sentinel for edge ranks.
+* **`MPI_Barrier`** for ordered per-rank output.
+* **`std::pair<double, double>`** as a return type plus a structured
+  binding (`auto [lo, hi] = ...`) at the call site.
+* **`std::fflush(stdout)`** to force prints before the barrier so
+  the next rank does not start printing while this rank's output is
+  still buffered.
+* **Even-as-possible decomposition arithmetic** with remainder
+  spreading across the first few ranks.
+
+### Possible interview Q&A
+
+* **Q:** Why a 1D (horizontal strip) decomposition instead of 2D
+  (rectangles)?
+* **A:** 1D is simpler: each rank has at most two neighbors and one
+  exchange direction. 2D has up to 8 neighbors counting corners and
+  doubles the halo bookkeeping. 1D works well up to a few hundred
+  ranks; 2D wins for very large rank counts because halo traffic
+  scales with strip width. For the scope of this project, 1D is the
+  right trade-off.
+* **Q:** Why allocate one halo row per neighbor instead of two?
+* **A:** The 5-point stencil reaches **exactly one cell** in each
+  direction. So we only need one row of remote data on each side.
+  A wider stencil (say a 9-point or higher-order one) would need
+  proportionally more halo rows.
+* **Q:** Why does each rank in your output show a different `max`
+  value at the boundary between rank 1 and rank 2?
+* **A:** That is the bug slice 9 fixes. The halo rows are still
+  zero in slice 8. Heat that should flow across the rank boundary
+  leaks into the zero halo and is lost. Once `MPI_Sendrecv` fills
+  the halo with the neighbor's actual data each timestep, the
+  asymmetry disappears and the result matches the serial solver
+  bit-for-bit (within float tolerance).
+* **Q:** What is `MPI_PROC_NULL` for?
+* **A:** A sentinel destination/source for MPI point-to-point calls.
+  Passing it makes the call a no-op. The advantage is that the same
+  send/receive line works for interior ranks (real neighbor) and
+  edge ranks (no neighbor) without branching in user code.
+
+---
+
+*Slice 9 next: `MPI_Sendrecv` halo exchange. The hardest single
+piece of the project. Teach-loop, very carefully, with the deadlock
+argument front and center.*
