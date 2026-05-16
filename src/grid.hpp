@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <vector>
 
@@ -17,6 +18,19 @@ public:
     std::size_t rows() const { return rows_; }
     std::size_t cols() const { return cols_; }
     std::size_t size() const { return data_.size(); }
+
+    // Row-major indexing: cell (i, j) sits at offset i * cols + j in the
+    // flat data_ buffer. Two overloads so that a non-const Grid can be
+    // written to and a const Grid can still be read from.
+    double& operator()(std::size_t i, std::size_t j) {
+        assert(i < rows_ && j < cols_);
+        return data_[i * cols_ + j];
+    }
+
+    const double& operator()(std::size_t i, std::size_t j) const {
+        assert(i < rows_ && j < cols_);
+        return data_[i * cols_ + j];
+    }
 
 private:
     std::size_t rows_;

@@ -23,6 +23,7 @@
 6. [OpenMPI version vs MPI standard version](#6-openmpi-version-vs-mpi-standard-version)
 7. [The `Grid` class: scaffolding (slice 1)](#7-the-grid-class-scaffolding-slice-1)
 8. [GoogleTest in CMake and the first Grid tests (slice 2)](#8-googletest-in-cmake-and-the-first-grid-tests-slice-2)
+9. [Indexing operator with const overloads, real TDD (slice 3)](#9-indexing-operator-with-const-overloads-real-tdd-slice-3)
 
 ---
 
@@ -706,5 +707,188 @@ the proper red-green-refactor cycle.
 
 ---
 
-*This doc grows as the project does. Next entry will cover the indexing
-operator with the first true TDD slice.*
+## 9. Indexing operator with const overloads, real TDD (slice 3)
+
+**TL;DR:** Added `operator()(i, j)` in two flavors. A non-const version
+returning `double&` (for write), a const version returning `const double&`
+(for read on const Grids). Each does `assert(i < rows_ && j < cols_)` for
+debug-time bounds checking, then returns `data_[i * cols_ + j]` to honor
+the row-major layout. Followed strict TDD: failing test first, then
+implementation.
+
+### The TDD cycle in three observations
+
+1. **Red.** Tests were added that called `g(i, j) = ...` and read it
+   back. The build failed with `type 'Grid' does not provide a call
+   operator`. The test caught the absence of the feature.
+2. **Green.** Two `operator()` overloads were added to grid.hpp. Tests
+   passed on the next build.
+3. **Refactor.** None needed; the implementation is already as small as
+   it can be.
+
+This cycle is the point of TDD: **prove the test detects the missing
+feature before the feature is implemented**. If you wrote the operator
+first and the test passed on its first run, you would not know whether
+the test would have caught a regression.
+
+### The code that landed
+
+```cpp
+double& operator()(std::size_t i, std::size_t j) {
+    assert(i < rows_ && j < cols_);
+    return data_[i * cols_ + j];
+}
+
+const double& operator()(std::size_t i, std::size_t j) const {
+    assert(i < rows_ && j < cols_);
+    return data_[i * cols_ + j];
+}
+```
+
+### New concepts and why each matters
+
+#### `operator()` is the call operator, repurposed for indexing
+
+`operator()` is the **function call operator**. When you write `g(i, j)`,
+the compiler asks: is `g` callable? If `g` is a function, normal call.
+If `g` is an object whose class defines `operator()`, that operator is
+invoked with `(i, j)`. The same mechanism is what makes **lambdas
+callable**: a lambda is a compiler-generated class with `operator()`.
+
+**Why not `operator[]` for 2D?** In C++17, `operator[]` accepts only one
+argument: `g[i]`. You cannot write `g[i, j]` (well, you can, but the
+comma is treated as the comma operator, not as two arguments). C++23
+finally allowed multi-argument `operator[]`, but we are on C++17. So
+`operator()` is the conventional choice for `n`-dimensional indexing.
+
+**Alternative:** some libraries use `g[i][j]` by returning a proxy
+"row" object from `operator[]` that itself defines `operator[]`. It
+works but adds complexity. Eigen, the most popular C++ linear-algebra
+library, uses `operator()` for matrix indexing for exactly the reasons
+above. Good company.
+
+#### Function overloading on `const`
+
+C++ allows two methods with the same name and same argument types if
+they differ only in their **const-ness**:
+
+```cpp
+double& operator()(...) { ... }                // chosen when 'this' is non-const
+const double& operator()(...) const { ... }    // chosen when 'this' is const
+```
+
+The compiler dispatches based on whether the object you call it on is
+itself const:
+
+```cpp
+Grid g(3, 3);
+g(0, 0) = 1.0;          // calls non-const overload, gets writeable ref
+
+const Grid& cg = g;
+double x = cg(0, 0);    // calls const overload, gets read-only ref
+// cg(0, 0) = 5.0;      // compile error: cannot assign to const double&
+```
+
+This is one of the cleanest examples in C++ of "the const overload
+exists so the compiler can enforce read-only access on const objects."
+**It is also the answer to "why two near-duplicate function bodies"**:
+the duplication has a real purpose, and a senior reviewer will see it
+as a sign of `const`-correctness discipline.
+
+There is a clever idiom to write the non-const version in terms of the
+const one using `const_cast`, but it is a level-up trick. Two clean
+bodies is fine.
+
+#### References as return types
+
+`double& operator()` returns a **reference** to the cell, not a copy.
+Returning a reference is what makes assignment work:
+
+```cpp
+g(1, 2) = 3.14;
+```
+
+If `operator()` returned `double` (by value), `g(1, 2)` would yield a
+**copy** of the double, and assigning to that copy would be meaningless
+(in fact, would not even compile because temporaries are not l-values).
+Returning `double&` says "here is the actual cell; do what you want
+with it." That is what lets us write to the grid.
+
+**Lifetime caveat:** never return a reference to a local variable. The
+reference would dangle as soon as the function returns. In `operator()`
+we are returning a reference into `data_`, which lives as long as the
+Grid lives, so the reference is safe.
+
+#### `assert` for debug-only bounds checking
+
+```cpp
+#include <cassert>
+...
+assert(i < rows_ && j < cols_);
+```
+
+`assert(expr)` is a macro from `<cassert>`:
+
+* **Debug builds** (no `-DNDEBUG`): if `expr` is false, the program
+  prints a message and calls `abort()`. The failure message includes
+  the file, line, and the failed expression. Excellent for catching
+  out-of-bounds indexing during development.
+* **Release builds** (with `-DNDEBUG`, which CMake's Release config
+  defines): the macro expands to nothing. **Zero runtime cost.**
+
+This is the classic C/C++ pattern: pay for safety while developing,
+pay nothing in production. Reservoir simulators do this all over their
+hot loops.
+
+**Trade-off:** a stencil kernel running 10 million times per second
+cannot afford runtime range checks in production. `assert` lets us
+have the checks during development and erases them in Release. If we
+wanted *always-on* range checking we would use `if (...) throw
+std::out_of_range(...)` or `std::vector::at()` (which throws on
+out-of-range).
+
+### What this slice added functionally
+
+The Grid is now a real 2D array you can read from and write to:
+
+```cpp
+Grid g(100, 200);
+g(10, 20) = 3.14;
+double x = g(10, 20);   // x == 3.14
+```
+
+Three new tests cover write-then-read round-trips, default-zero state,
+and read-from-const access. The serial heat equation step in slice 5
+will lean heavily on this operator.
+
+### Possible interview Q&A
+
+* **Q:** Why two `operator()` overloads instead of one?
+* **A:** The non-const overload returns `double&` so a writeable Grid
+  supports `g(i, j) = x`. The const overload returns `const double&`
+  so a `const Grid&` can still be read from. Without the const
+  overload, you could not pass a `Grid` by const reference and read
+  its cells, which is the natural way to take a function argument
+  that only needs to read.
+* **Q:** Why `operator()` instead of `operator[]` for 2D indexing?
+* **A:** In C++17, `operator[]` takes only one argument, so `g[i, j]`
+  does not work. `operator()` accepts any number of arguments, which
+  is why Eigen and most linear-algebra libraries use it for matrix
+  indexing. C++23 lifted the restriction on `operator[]`.
+* **Q:** What does `assert` cost in production?
+* **A:** Nothing. With `-DNDEBUG` set (which CMake's Release config
+  defines), the `assert` macro expands to nothing and the bounds
+  checks compile out completely. The checks help me catch bugs during
+  development without slowing the production hot path.
+* **Q:** Why return a reference and not a value?
+* **A:** Returning a reference is what allows `g(i, j) = 3.14` to
+  modify the actual cell. A by-value return would yield a copy, and
+  assigning to that copy is either a compile error (because temporaries
+  are not l-values) or meaningless (you would be writing to a discarded
+  copy). The reference also avoids copying a `double` unnecessarily on
+  every read.
+
+---
+
+*Slice 4 lands next: Grid fill helper and PGM file output, shipped
+ship-first since both are plumbing.*

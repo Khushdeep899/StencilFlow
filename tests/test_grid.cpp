@@ -24,3 +24,28 @@ TEST(GridTest, EmptyGridIsValid) {
     EXPECT_EQ(g.cols(), 0u);
     EXPECT_EQ(g.size(), 0u);
 }
+
+TEST(GridTest, AllCellsZeroByDefault) {
+    Grid g(3, 5);
+    for (std::size_t i = 0; i < g.rows(); ++i) {
+        for (std::size_t j = 0; j < g.cols(); ++j) {
+            EXPECT_EQ(g(i, j), 0.0);
+        }
+    }
+}
+
+TEST(GridTest, WriteThenReadRoundTrips) {
+    Grid g(3, 5);
+    g(1, 2) = 3.14;
+    g(2, 4) = -7.5;
+    EXPECT_EQ(g(1, 2), 3.14);
+    EXPECT_EQ(g(2, 4), -7.5);
+    EXPECT_EQ(g(0, 0), 0.0);  // untouched cells stay zero
+}
+
+TEST(GridTest, ConstGridIsReadable) {
+    Grid g(2, 2);
+    g(0, 0) = 9.0;
+    const Grid& cg = g;          // const reference to the same object
+    EXPECT_EQ(cg(0, 0), 9.0);    // only compiles if a const overload exists
+}
