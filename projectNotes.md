@@ -32,6 +32,7 @@
 15. [MPI_Sendrecv halo exchange (slice 9)](#15-mpi_sendrecv-halo-exchange-slice-9)
 16. [MPI_Gatherv and intermediate frames (slice 10)](#16-mpi_gatherv-and-intermediate-frames-slice-10)
 17. [Hybrid vs serial byte-identical validation (slice 11)](#17-hybrid-vs-serial-byte-identical-validation-slice-11)
+18. [Strong and weak scaling benchmarks (slice 12)](#18-strong-and-weak-scaling-benchmarks-slice-12)
 
 ---
 
@@ -1903,6 +1904,126 @@ cmp frames_serial/...final.pgm frames_hybrid/...final.pgm    # PASS = exit 0
 
 ---
 
-*Slice 12 next: scaling benchmark scripts (strong + weak) and
-matplotlib plots. Ship-first. The two plots are the visual headline
-of the README.*
+## 18. Strong and weak scaling benchmarks (slice 12)
+
+**TL;DR:** `benchmarks/run.sh` runs the solver at 1, 2, 4, and 8 MPI
+ranks for both strong and weak scaling, writes a CSV.
+`benchmarks/plot.py` reads the CSV and renders the two plots to
+`docs/`. On Apple Silicon: **~3.4x speedup at 4 ranks for strong
+scaling, 0.83 efficiency at 4 ranks for weak scaling.** Performance
+degrades at 8 ranks because of heterogeneous cores plus MPI
+overhead.
+
+### Strong vs weak scaling: the two questions
+
+| | Strong scaling | Weak scaling |
+| --- | --- | --- |
+| Problem size | Fixed | Grows with rank count |
+| Work per rank | Shrinks with rank count | Constant |
+| Question answered | "How much faster can I solve a given problem?" | "Can I solve a proportionally bigger problem in the same time?" |
+| Metric | Speedup = T1 / Tn | Efficiency = T1 / Tn |
+| Ideal | Linear (y = x) | Flat at 1.0 |
+| Limited by | Amdahl's law (serial fraction) | Gustafson's law + communication overhead |
+
+Both are standard. **Production reports almost always include
+both.** Strong scaling matters for users with fixed problems wanting
+faster turnaround. Weak scaling matters for users solving ever
+larger problems on ever larger clusters.
+
+### Measured numbers on this Mac (M-series)
+
+Strong scaling, 1024x1024, 1000 steps:
+
+| Ranks | Time (s) | Speedup |
+| --- | --- | --- |
+| 1 | 1.694 | 1.00x |
+| 2 | 0.899 | **1.88x** |
+| 4 | 0.500 | **3.39x** |
+| 8 | 1.185 | 1.43x (regression) |
+
+Weak scaling, 512 rows per rank, 1024 cols, 1000 steps:
+
+| Ranks | Total rows | Time (s) | Efficiency |
+| --- | --- | --- | --- |
+| 1 | 512 | 0.853 | 1.00 |
+| 2 | 1024 | 0.893 | **0.96** |
+| 4 | 2048 | 1.028 | **0.83** |
+| 8 | 4096 | 3.931 | 0.22 (regression) |
+
+### Why 8 ranks regresses on this hardware
+
+Three reinforcing causes:
+
+1. **Heterogeneous cores.** Apple Silicon has 4 performance cores
+   and 4 efficiency cores. When MPI spawns 8 processes, four of
+   them inevitably land on efficiency cores that run at roughly
+   half the clock and half the IPC of the perf cores. The slowest
+   rank holds up the whole solve at every barrier and halo
+   exchange.
+2. **Communication-to-compute ratio.** Each rank exchanges 2 *
+   cols * 8 bytes of halo data per step. As ranks double, the
+   compute per rank halves, but the halo bytes per rank stay
+   constant. Communication overhead becomes a larger fraction of
+   each step.
+3. **MPI process startup cost.** `mpirun -n 8` has more overhead
+   than `mpirun -n 4`. For our ~1s-2s workloads, this can be
+   measurable.
+
+On a **homogeneous cluster** (which is what CMG runs on), reason 1
+disappears and the curve extends further before plateauing. On
+**larger problems** reason 2 and 3 amortize down. So 8 ranks on a
+laptop being slow is a hardware artifact, not a code defect.
+
+### The scripts
+
+`run.sh` runs `mpirun -n N ./stencilflow ...` for each rank count,
+parses the `elapsed:` line from stdout, appends a row to
+`results.csv`. `plot.py` reads the CSV and renders two PNGs.
+Trivial code; the work is in choosing good parameters (problem big
+enough that MPI overhead does not dominate).
+
+### Topics that landed
+
+* **Strong vs weak scaling** definitions and metrics.
+* **Amdahl's law**: speedup is limited by the serial fraction of a
+  program. As parallelism grows, the serial part stops mattering
+  less and the curve flattens.
+* **Gustafson's law**: weak scaling stays good as long as the
+  problem grows with the parallelism. Communication overhead
+  eventually limits it too.
+* **Honest reporting**: showing where the code regresses is
+  better than cherry-picking the rank counts that look nice.
+  Interviewers will respect the honesty and the explanation more
+  than a falsely-flattering plot.
+
+### Possible interview Q&A
+
+* **Q:** Walk me through your scaling results.
+* **A:** Strong scaling shows ~1.9x speedup at 2 ranks and ~3.4x at
+  4 ranks, both close to the linear-ideal line. At 8 ranks the
+  speedup drops to ~1.4x. The regression happens because Apple
+  Silicon has 4 performance cores and 4 efficiency cores; 8 MPI
+  processes inevitably schedule half of them onto the efficiency
+  cores, which run slower, and the slowest rank holds up every
+  halo exchange. On a homogeneous cluster the curve would extend
+  further before plateauing.
+* **Q:** What is Amdahl's law?
+* **A:** The maximum speedup of a program is bounded by 1 over the
+  serial fraction. If 10% of your code is inherently serial, you
+  cannot exceed a 10x speedup no matter how many cores. The other
+  side is Gustafson's law: as you scale problem size with
+  parallelism, the serial fraction shrinks and you can keep getting
+  useful speedup. That is why weak scaling is the more relevant
+  measure for many scientific applications.
+* **Q:** Why does your weak scaling efficiency drop at 8 ranks?
+* **A:** Same root cause as strong scaling at 8: heterogeneous
+  cores. The slowest rank dictates each step's elapsed time, so
+  when half the ranks are on efficiency cores the apparent
+  efficiency drops. Communication overhead is the secondary
+  contributor: as ranks increase, halo traffic grows even though
+  per-rank work stays constant.
+
+---
+
+*Slice 13 next: polish the README with the two plots embedded and
+the design rationale spelled out. Ship-first.*
