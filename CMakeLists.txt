@@ -40,6 +40,7 @@ find_package(MPI REQUIRED)
 add_executable(stencilflow
     src/main.cpp
     src/grid.cpp
+    src/stencil.cpp
 )
 
 target_link_libraries(stencilflow PRIVATE MPI::MPI_CXX)

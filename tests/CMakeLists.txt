@@ -4,7 +4,9 @@
 
 add_executable(grid_tests
     test_grid.cpp
+    test_stencil.cpp
     ${CMAKE_SOURCE_DIR}/src/grid.cpp
+    ${CMAKE_SOURCE_DIR}/src/stencil.cpp
 )
 
 # Grid is currently a header-only class, so we only need its include path,

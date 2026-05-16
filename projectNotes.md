@@ -25,6 +25,7 @@
 8. [GoogleTest in CMake and the first Grid tests (slice 2)](#8-googletest-in-cmake-and-the-first-grid-tests-slice-2)
 9. [Indexing operator with const overloads, real TDD (slice 3)](#9-indexing-operator-with-const-overloads-real-tdd-slice-3)
 10. [Grid fill and PGM output (slice 4)](#10-grid-fill-and-pgm-output-slice-4)
+11. [The 5-point stencil and double-buffering (slice 5)](#11-the-5-point-stencil-and-double-buffering-slice-5)
 
 ---
 
@@ -967,6 +968,194 @@ visible image.
 
 ---
 
-*Slice 5 next: the 5-point stencil step function and double-buffering.
-Back into teach-loop because this is the heart of the solver and
-exactly the kind of code Lyle will read line by line.*
+## 11. The 5-point stencil and double-buffering (slice 5)
+
+**TL;DR:** One explicit forward-Euler timestep of the 2D heat
+equation. Reads from `in`, writes to `out`. Interior cells use the
+5-point Laplacian stencil; boundary cells are copied unchanged
+(Dirichlet BC). Three tests prove the math is correct to the bit.
+
+### The math, end to end
+
+The heat equation:
+
+```
+du/dt = alpha * (d^2 u/dx^2 + d^2 u/dy^2)
+```
+
+Discretize time with **forward Euler**:
+
+```
+u(t + dt) = u(t) + dt * du/dt
+```
+
+Discretize space with the **5-point Laplacian**:
+
+```
+d^2 u/dx^2 + d^2 u/dy^2  ~=
+    (u[i-1,j] + u[i+1,j] + u[i,j-1] + u[i,j+1] - 4 * u[i,j]) / dx^2
+```
+
+assuming `dx = dy`. Absorb everything into one dimensionless
+**diffusion number** `c = alpha * dt / dx^2`:
+
+```
+u_new[i,j] = (1 - 4c) * u[i,j]
+             + c * (u[i-1,j] + u[i+1,j] + u[i,j-1] + u[i,j+1])
+```
+
+Every cell becomes a weighted average of itself and its four
+neighbors. **Memorize that single line. It is the physics of the
+project.**
+
+### Stability: `c <= 0.25` in 2D
+
+Forward Euler is **conditionally stable**. If `c` exceeds 0.25,
+rounding errors blow up exponentially and the simulation explodes
+into infinity. We hardcode `c = 0.2` as a safe default.
+
+**Implicit schemes** (used by CMG's real solvers) are
+**unconditionally stable** but require solving a linear system every
+step (CG, GMRES). Explicitly out of scope here.
+
+### Why double-buffering
+
+Naive in-place:
+
+```cpp
+for each (i, j):
+    u[i,j] = (1 - 4c)*u[i,j] + c*(u[i-1,j] + u[i+1,j] + u[i,j-1] + u[i,j+1]);
+```
+
+By the time you reach cell `(1, 5)`, you have already overwritten
+`(0, 5)` and `(1, 4)`. Those updated values then leak into the math
+for `(1, 5)`. **You are mixing old and new timestep values in the
+same step. Wrong answer.**
+
+Fix: two grids, `in` (read-only this step) and `out` (destination).
+After the step, swap them. **The `step()` function signature**:
+
+```cpp
+void step(const Grid& in, Grid& out, double c);
+```
+
+Note `const Grid&` for input. That is `const`-correctness paying off:
+the compiler enforces that `step` cannot accidentally mutate `in`.
+
+### Dirichlet boundary conditions, why and how
+
+A cell on the edge has fewer than 4 neighbors. We pick **Dirichlet**:
+the edge values are fixed, copied verbatim from `in` to `out`. Heat
+cannot leave the domain through the edges.
+
+Other choices exist (**Neumann** = zero flux through edges,
+**absorbing** = heat is removed at edges, **periodic** = the grid
+wraps around). Dirichlet is the simplest and fine for our demo.
+
+### New language idioms in this slice
+
+#### Forward declaration `class Grid;`
+
+`stencil.hpp` says:
+
+```cpp
+class Grid;          // <-- forward declaration, not a definition
+void step(const Grid& in, Grid& out, double c);
+```
+
+We do **not** `#include "grid.hpp"` here. Why does this work?
+
+The signatures take `Grid` only by **reference**. A reference is
+implementable as a pointer under the hood, and the compiler does not
+need to know the size or layout of `Grid` to take its address. Only
+that "`Grid` is some type." Forward declaration tells the compiler
+exactly that.
+
+**Why bother?** Two reasons:
+
+1. **Faster compilation.** `grid.hpp` includes `<algorithm>`,
+   `<cassert>`, `<cstddef>`, `<string>`, `<vector>`. Every file that
+   includes `stencil.hpp` would inherit all of that. Forward
+   declaration limits the pull-through.
+2. **Breaks include cycles.** If A.hpp and B.hpp both need to mention
+   each other's types, forward declaration is how you avoid an
+   infinite include loop.
+
+The actual `#include "grid.hpp"` lives in `stencil.cpp` because the
+implementation calls `in.rows()`, `in(i, j)`, etc., which need the
+full class definition. **This is the textbook header/.cpp
+separation.**
+
+#### Loop bound idiom `i + 1 < rows`
+
+Compare:
+
+```cpp
+for (std::size_t i = 1; i + 1 < rows; ++i) { ... }     // correct
+for (std::size_t i = 1; i < rows - 1; ++i) { ... }     // buggy when rows == 0
+```
+
+`std::size_t` is **unsigned**. If `rows == 0`, then `rows - 1`
+underflows to `SIZE_MAX` (the largest possible size_t), and the loop
+runs ~18 quintillion times before crashing or producing garbage.
+The `i + 1 < rows` form is safe because there is no subtraction.
+
+**This trap is one of the top bugs in unsigned-loop code.** Memorize
+the safe form.
+
+#### `EXPECT_DOUBLE_EQ` vs `EXPECT_EQ`
+
+The stencil tests use `EXPECT_DOUBLE_EQ`. Why?
+
+`EXPECT_EQ(a, b)` for doubles compares with `==`. That is too strict:
+`0.1 + 0.2 != 0.3` in IEEE 754. **`EXPECT_DOUBLE_EQ`** instead checks
+that two doubles are within **4 ULPs** (units-in-the-last-place) of
+each other, which is GoogleTest's standard for "essentially equal."
+
+Our specific tests pass even with `EXPECT_EQ` because we picked values
+(`c = 0.2`, exactly representable arithmetic at small grid sizes)
+where the math is exact. But it is bad practice to rely on that for
+floating point. Use `_DOUBLE_EQ` for any float comparison.
+
+### What this slice added functionally
+
+One full timestep of the heat equation, running on a single CPU
+core, single process. No OpenMP yet, no MPI. Pure serial reference.
+
+This `step()` function is what slice 7 will parallelize with OpenMP
+(`#pragma omp parallel for collapse(2)`) and what slice 9 will run
+in parallel across MPI ranks with halo exchange between them.
+
+### Possible interview Q&A
+
+* **Q:** Why double-buffering instead of in-place update?
+* **A:** The 5-point stencil reads four neighbors. If you update the
+  grid in place, by the time you reach `(i, j)` you have already
+  overwritten its north and west neighbors with new-timestep values,
+  so your update mixes old and new data. That is mathematically
+  wrong. Two grids (read-only `in`, write `out`) keep the entire
+  step in one consistent timestep snapshot. After the step, swap.
+* **Q:** Why is `c = 0.25` the stability limit?
+* **A:** That is the CFL-like condition for forward-Euler explicit
+  time stepping on a 2D 5-point Laplacian. Above 0.25 the
+  discrete eigenvalues of the update operator exceed 1 in magnitude,
+  so errors grow exponentially every step. The fix is either a
+  smaller time step (lower `c`) or an implicit scheme that is
+  unconditionally stable.
+* **Q:** Why forward-declare `Grid` in `stencil.hpp` instead of
+  including `grid.hpp`?
+* **A:** The signatures use `Grid` only by reference, so the
+  compiler does not need the full class definition. Forward
+  declaration cuts compile time (no transitive pull of vector,
+  algorithm, etc.) and avoids potential include cycles.
+* **Q:** Why use `i + 1 < rows` instead of `i < rows - 1`?
+* **A:** `rows` is `size_t`, which is unsigned. If `rows == 0`,
+  `rows - 1` underflows to `SIZE_MAX` and the loop runs effectively
+  forever. The `i + 1 < rows` form has no subtraction and is safe
+  for any `rows`.
+
+---
+
+*Slice 6 next: wire `step()` into a real time loop inside main.cpp
+with initial hot-spot conditions, then verify visually by writing
+PGM frames. Shipped ship-first.*
