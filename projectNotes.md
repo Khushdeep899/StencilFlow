@@ -33,6 +33,7 @@
 16. [MPI_Gatherv and intermediate frames (slice 10)](#16-mpi_gatherv-and-intermediate-frames-slice-10)
 17. [Hybrid vs serial byte-identical validation (slice 11)](#17-hybrid-vs-serial-byte-identical-validation-slice-11)
 18. [Strong and weak scaling benchmarks (slice 12)](#18-strong-and-weak-scaling-benchmarks-slice-12)
+19. [Dockerfile and GitHub Actions CI (slices 14 and 15)](#19-dockerfile-and-github-actions-ci-slices-14-and-15)
 
 ---
 
@@ -2025,5 +2026,95 @@ enough that MPI overhead does not dominate).
 
 ---
 
-*Slice 13 next: polish the README with the two plots embedded and
-the design rationale spelled out. Ship-first.*
+## 19. Dockerfile and GitHub Actions CI (slices 14 and 15)
+
+**TL;DR:** Two-stage Dockerfile (builder + runtime) so the published
+image is small and only contains what mpirun needs. CI on
+`ubuntu-latest` builds, runs the 16 unit tests, runs a smoke
+mpirun, and runs the byte-identity validation. A separate job
+builds the Docker image as final smoke.
+
+### Why a two-stage Dockerfile
+
+```
+FROM ubuntu:22.04 AS builder    # has cmake, gcc, MPI dev headers
+... build, test ...
+FROM ubuntu:22.04 AS runtime    # has only mpirun + libgomp1
+COPY --from=builder ...
+```
+
+* The builder needs ~500 MB of build tools. The runtime needs ~80 MB
+  of just the MPI runtime. Two-stage cuts the **published image
+  size** by an order of magnitude.
+* Tests run in the builder. If they fail, the build fails, and no
+  image is produced. The runtime stage cannot be reached unless
+  tests pass.
+* Surface area in the runtime image is minimal, which is what you
+  want for any production-adjacent container.
+
+### Why a non-root `stencil` user in the runtime stage
+
+OpenMPI complains if `mpirun` is launched as root in a container.
+The complaint is correct: running parallel jobs as root in
+production is a foot-gun, both for security and because it can
+confuse process accounting. The Dockerfile creates a `stencil`
+user and runs the default `CMD` as that user.
+
+### Why CI on `ubuntu-latest` rather than inside Docker
+
+Two parallel jobs:
+
+1. **`build-and-test`** runs natively on `ubuntu-latest` with
+   apt-installed MPI and OpenMP. Fast (no image build), and runs
+   the unit tests + byte-identity validate.sh.
+2. **`docker-build`** runs `docker buildx build` to confirm the
+   Dockerfile still produces a working image, gated on
+   `build-and-test` passing first.
+
+Splitting them gives **fast feedback** for the common case (typo,
+test break) without ever paying for a Docker build, while still
+catching Dockerfile drift on every push.
+
+### What CI proves
+
+Every push to `main` or PR runs the workflow and confirms:
+
+* The code compiles on Linux with GCC + OpenMPI (not just macOS
+  with Apple clang + Homebrew OpenMPI).
+* All 16 unit tests pass.
+* A 2-rank mpirun smoke test completes.
+* The hybrid solver produces byte-identical PGM output to the
+  serial path (`benchmarks/validate.sh`).
+* The Docker image builds end to end.
+
+### Topics that landed
+
+* **Multi-stage Docker builds** for small, secure runtime images.
+* **Non-root container user** as a security baseline.
+* **CI matrix patterns**: split fast feedback from slow Docker
+  build; gate the slow job on the fast one.
+* **Embedding correctness in CI**: running `validate.sh` in CI
+  means the byte-identity claim is checked on every push, not just
+  manually on a developer's machine.
+
+### Possible interview Q&A
+
+* **Q:** Why a two-stage Dockerfile?
+* **A:** The build stage needs cmake, gcc, MPI dev headers, and
+  test-running infrastructure. The runtime stage only needs the
+  MPI launcher and OpenMP runtime. Splitting them shrinks the
+  published image by an order of magnitude and minimizes the
+  attack surface. The build stage also runs tests, so a failing
+  test breaks the image build.
+* **Q:** Why does CI run validate.sh, not just the unit tests?
+* **A:** The unit tests cover the Grid class, the stencil math,
+  and the decomposition arithmetic. They do not actually exercise
+  MPI communication across ranks. `validate.sh` does: it runs
+  the real solver under `mpirun -n 1` and `mpirun -n 4` and
+  proves the outputs are byte-identical. That covers the halo
+  exchange path that no unit test can reach.
+
+---
+
+*Project shipped. The remaining work is interview prep: open
+projectNotes.md and rehearse the Q&A blocks out loud.*
