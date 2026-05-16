@@ -22,6 +22,7 @@
 5. [`MPI_Get_processor_name` and the C-style buffer pattern](#5-mpi_get_processor_name-and-the-c-style-buffer-pattern)
 6. [OpenMPI version vs MPI standard version](#6-openmpi-version-vs-mpi-standard-version)
 7. [The `Grid` class: scaffolding (slice 1)](#7-the-grid-class-scaffolding-slice-1)
+8. [GoogleTest in CMake and the first Grid tests (slice 2)](#8-googletest-in-cmake-and-the-first-grid-tests-slice-2)
 
 ---
 
@@ -518,5 +519,192 @@ No cell access, no I/O, no math. Those land in slices 2 and beyond.
 
 ---
 
-*This doc grows as the project does. Next entry will cover GoogleTest
-integration into CMake and the first three Grid tests.*
+## 8. GoogleTest in CMake and the first Grid tests (slice 2)
+
+**TL;DR:** GoogleTest is wired in via **`FetchContent`** (a CMake module
+that downloads dependencies at configure time) rather than
+`find_package`. Tests live in `tests/` as their own subdirectory.
+`gtest_discover_tests` registers each `TEST()` block as its own CTest
+entry. Three smoke tests cover the Grid's dimensions and size.
+
+### Files touched
+
+* Root `CMakeLists.txt`: added `FetchContent` for GoogleTest,
+  `enable_testing()`, `add_subdirectory(tests)`.
+* `tests/CMakeLists.txt`: new file. Defines the `grid_tests` executable,
+  includes `src/`, links against `GTest::gtest_main`, calls
+  `gtest_discover_tests`.
+* `tests/test_grid.cpp`: new file. Three tests.
+
+### The root CMakeLists.txt additions
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG        v1.14.0
+)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+
+enable_testing()
+add_subdirectory(tests)
+```
+
+### The test file
+
+```cpp
+#include <gtest/gtest.h>
+#include "grid.hpp"
+
+TEST(GridTest, RecordsDimensions) {
+    Grid g(4, 8);
+    EXPECT_EQ(g.rows(), 4u);
+    EXPECT_EQ(g.cols(), 8u);
+}
+
+TEST(GridTest, SizeIsRowsTimesCols) {
+    Grid g(4, 8);
+    EXPECT_EQ(g.size(), 32u);
+}
+
+TEST(GridTest, EmptyGridIsValid) {
+    Grid g(0, 0);
+    EXPECT_EQ(g.rows(), 0u);
+    EXPECT_EQ(g.cols(), 0u);
+    EXPECT_EQ(g.size(), 0u);
+}
+```
+
+### New concepts and why each matters
+
+#### FetchContent (CMake dependency downloader)
+
+**`FetchContent`** is a CMake module that downloads source from GitHub at
+configure time and builds it as part of your project.
+
+**Why over `find_package(GTest)`:**
+
+* `find_package` requires the dependency to be installed on the system
+  (`brew install googletest`, `apt install libgtest-dev`). **Fragile in
+  CI**: a fresh Docker container has no GTest unless an extra install
+  step is added.
+* `find_package` picks up whatever version is on the system, which can
+  differ between developers and break reproducibly. **`FetchContent`
+  pins a specific tag** (here, `v1.14.0`).
+
+The price: the first `cmake -B build` after adding `FetchContent` is
+slower because the dependency is downloaded and compiled. Subsequent
+configures reuse the cache.
+
+#### `enable_testing()` and CTest
+
+`enable_testing()` turns on CTest, CMake's bundled test runner. After
+the build, `ctest --test-dir build` runs every test that was registered
+with `add_test()` or `gtest_discover_tests()`.
+
+**Why use CTest at all and not just run the test binary directly?**
+
+* `ctest` runs tests in parallel and aggregates pass/fail counts.
+* It hides per-test stdout unless `--output-on-failure` is passed, which
+  keeps CI logs short.
+* It integrates with build systems and CI dashboards.
+
+#### `gtest_discover_tests` vs `add_test`
+
+The old way:
+
+```cmake
+add_test(NAME grid_tests COMMAND grid_tests)
+```
+
+One CTest entry for the whole test binary. If any one of the three
+tests fails, you see "grid_tests failed" with no clue which one.
+
+The new way:
+
+```cmake
+include(GoogleTest)
+gtest_discover_tests(grid_tests)
+```
+
+CMake scans the binary at build time, finds every `TEST()` block, and
+registers each as its own CTest entry. The ctest output shows
+`GridTest.RecordsDimensions` and `GridTest.EmptyGridIsValid` as
+separate lines, each with its own pass/fail status.
+
+#### `add_subdirectory(tests)`
+
+This tells CMake to descend into the `tests/` directory and process
+**its** `CMakeLists.txt` as part of the build. **Why split it out:**
+
+* The root `CMakeLists.txt` stays focused on the main `stencilflow`
+  executable. Test wiring is its own concern.
+* When the project grows (later: `benchmarks/` directory), each gets
+  its own `CMakeLists.txt` and `add_subdirectory` call.
+* Lyle will recognize this as the standard project layout. A monolithic
+  root CMakeLists is a smell.
+
+#### GoogleTest basics
+
+* `TEST(TestSuite, TestName) { ... }` declares a test. **TestSuite** is a
+  grouping label (`GridTest` here); **TestName** is the individual
+  case (`RecordsDimensions`).
+* `EXPECT_EQ(a, b)` asserts `a == b`. On failure, the test fails but
+  **continues** executing remaining assertions in the same TEST block.
+* `ASSERT_EQ(a, b)` asserts `a == b`. On failure, the test **stops
+  immediately**. Use `ASSERT_` for preconditions where continuing makes
+  no sense (e.g., a pointer is non-null before dereferencing it).
+* **`GTest::gtest_main`** is a target that provides a default
+  `main()` function which runs every registered test. We do not write
+  our own `main()` in test files.
+
+#### The `u` suffix: `4u`, `8u`, `32u`
+
+`4` is an `int` (signed). `4u` is `unsigned int`. Why care here?
+
+`g.rows()` returns `std::size_t`, which is unsigned. Comparing it to a
+signed `int` literal works but emits a signed/unsigned mismatch warning
+under `-Wpedantic`. The suffix tells the compiler "this literal is
+unsigned" so the comparison is between two unsigned values, no warning.
+
+It is a small but visible habit. Sprinkle `u` on integer literals
+whenever you compare against `size_t` or any other unsigned type.
+
+### When this is TDD and when it is not
+
+Strict TDD says: **write the failing test first, then implement code to
+make it pass.** This slice is **not** TDD: the Grid class already
+existed (from slice 1), and we are retroactively writing tests for it.
+The tests passed on first run.
+
+**Slice 3 (the indexing operator) will be TDD:** I will write a failing
+test against `grid(i, j)` first, see it fail to compile (no such
+operator), then add the operator and watch the test go green. That is
+the proper red-green-refactor cycle.
+
+### Possible interview Q&A
+
+* **Q:** Why FetchContent instead of `find_package` for GoogleTest?
+* **A:** Reproducibility. `FetchContent` pins a specific GoogleTest
+  version (v1.14.0) and downloads it at configure time, so the build
+  works on any machine with internet and no separate install step.
+  `find_package` depends on whatever version the system happens to have
+  installed, which is fragile across developers and CI containers.
+* **Q:** Why `gtest_discover_tests` over `add_test`?
+* **A:** It registers each `TEST()` block as its own CTest entry, so
+  the ctest output shows which specific test failed. Plain `add_test`
+  lumps the whole binary into one entry and hides the failing test
+  name.
+* **Q:** Difference between `EXPECT_EQ` and `ASSERT_EQ`?
+* **A:** Both check equality. On failure, `EXPECT_EQ` reports and
+  continues running remaining assertions in the same test block;
+  `ASSERT_EQ` halts the test immediately. Use `ASSERT_` for
+  preconditions where continuing would crash or be meaningless, like
+  asserting a pointer is non-null before dereferencing.
+
+---
+
+*This doc grows as the project does. Next entry will cover the indexing
+operator with the first true TDD slice.*

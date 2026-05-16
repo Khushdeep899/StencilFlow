@@ -43,6 +43,23 @@ add_executable(stencilflow
 
 target_link_libraries(stencilflow PRIVATE MPI::MPI_CXX)
 
+# Tests. FetchContent downloads a pinned GoogleTest at configure time so
+# we never depend on a system-installed gtest, which makes CI Docker
+# builds reproducible. enable_testing() turns on the CTest target so
+# `ctest --test-dir build` works after the build.
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG        v1.14.0
+)
+# Stop GoogleTest from clobbering our compile options on Windows builds.
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+
+enable_testing()
+add_subdirectory(tests)
+
 # Status banner printed at configure time so we can spot mismatches
 # (e.g. CMake picking up the wrong MPI) before they confuse a build.
 message(STATUS "StencilFlow ${PROJECT_VERSION}")
