@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <string>
 #include <vector>
 
 class Grid {
@@ -31,6 +33,20 @@ public:
         assert(i < rows_ && j < cols_);
         return data_[i * cols_ + j];
     }
+
+    // Set every cell to value.
+    void fill(double value) {
+        std::fill(data_.begin(), data_.end(), value);
+    }
+
+    // Raw pointer access for MPI sends (slice 9) and bulk fills.
+    double*       data()       { return data_.data(); }
+    const double* data() const { return data_.data(); }
+
+    // Write the grid as a P5 (binary) PGM image. Values are
+    // auto-normalized from [min, max] to [0, 255]. Implementation in
+    // grid.cpp so <fstream> stays out of headers.
+    void write_pgm(const std::string& filename) const;
 
 private:
     std::size_t rows_;

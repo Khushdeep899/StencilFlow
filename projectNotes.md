@@ -24,6 +24,7 @@
 7. [The `Grid` class: scaffolding (slice 1)](#7-the-grid-class-scaffolding-slice-1)
 8. [GoogleTest in CMake and the first Grid tests (slice 2)](#8-googletest-in-cmake-and-the-first-grid-tests-slice-2)
 9. [Indexing operator with const overloads, real TDD (slice 3)](#9-indexing-operator-with-const-overloads-real-tdd-slice-3)
+10. [Grid fill and PGM output (slice 4)](#10-grid-fill-and-pgm-output-slice-4)
 
 ---
 
@@ -890,5 +891,82 @@ will lean heavily on this operator.
 
 ---
 
-*Slice 4 lands next: Grid fill helper and PGM file output, shipped
-ship-first since both are plumbing.*
+## 10. Grid fill and PGM output (slice 4)
+
+**TL;DR:** Added a `fill(value)` helper and a `write_pgm(filename)`
+method that dumps the grid as a binary PGM image. Auto-normalizes
+values from `[min, max]` to `[0, 255]` so any temperature range
+becomes visible grayscale. Implementation lives in `src/grid.cpp` so
+heavy headers stay out of `grid.hpp`. Shipped ship-first.
+
+### Why split into `grid.hpp` and `grid.cpp` now
+
+The fill is trivial enough to live inline in the header. The PGM
+writer needs `<fstream>`. **Putting `<fstream>` in a header would
+force every translation unit that includes `grid.hpp` to also parse
+`<fstream>`,** which is one of the heaviest standard headers and
+dramatically slows compile times.
+
+The idiom: **headers declare the interface; .cpp files implement and
+own the heavy includes.** A header should pull in only what its
+**public signatures** need.
+
+### PGM format in 30 seconds
+
+```
+P5
+<cols> <rows>
+<maxval>
+<raw bytes, one per cell, row-major>
+```
+
+* `P5` is the magic header for **binary** PGM. (`P2` is ASCII, larger
+  and slower.)
+* `<maxval>` is the max gray value, here `255`, so each cell is one
+  byte.
+* PGM puts **cols before rows** in the header, the opposite of how we
+  index `(i, j)`. Burn this in.
+
+We auto-normalize so the brightest cell becomes 255 and the darkest 0.
+A simulator can dump any temperature range and still produce a
+visible image.
+
+### Topics that landed
+
+* **`std::fill`** to set every element of a range.
+* **`std::minmax_element`** returns `(min_iter, max_iter)` in one pass
+  over the data.
+* **Structured bindings** (`auto [min_it, max_it] = ...`) to unpack
+  the pair cleanly. C++17 feature.
+* **`std::ofstream` and `std::ios::binary`** for raw byte writes.
+* **`static_cast<unsigned char>(...)`**: the modern, type-safe
+  alternative to C-style casts. Pinpoints intent ("I am converting a
+  double to a byte, on purpose").
+* **`std::runtime_error`** thrown on file-open failure. Caller can
+  catch; default behavior is `terminate()` with a printed `what()`.
+* **`Grid::data()` raw pointer accessor** (two overloads, const and
+  non-const). Needed for `MPI_Send` and friends, which take a raw
+  pointer plus count.
+* **Compile firewall**: header/.cpp split keeps heavy STL headers
+  scoped.
+
+### Possible interview Q&A
+
+* **Q:** Why is the PGM output in a .cpp file rather than the header?
+* **A:** `<fstream>` is one of the heaviest standard headers. If
+  `grid.hpp` included it, every file that uses `Grid` would pay the
+  compile-time cost of parsing fstream even if it never writes PGM.
+  The .cpp split limits that cost to one translation unit.
+* **Q:** Why auto-normalize instead of fixing a temperature range?
+* **A:** PGM stores one byte per cell, so we must map our doubles
+  into `[0, 255]`. Auto-normalization gives a visible image regardless
+  of the simulation's actual range. A real production tool would
+  expose a fixed range as a CLI option so animation frames stay on
+  the same color scale; that is a polish item, not load-bearing for
+  the interview demo.
+
+---
+
+*Slice 5 next: the 5-point stencil step function and double-buffering.
+Back into teach-loop because this is the heart of the solver and
+exactly the kind of code Lyle will read line by line.*

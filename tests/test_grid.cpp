@@ -5,6 +5,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
+#include <fstream>
+#include <string>
+
 #include "grid.hpp"
 
 TEST(GridTest, RecordsDimensions) {
@@ -48,4 +52,45 @@ TEST(GridTest, ConstGridIsReadable) {
     g(0, 0) = 9.0;
     const Grid& cg = g;          // const reference to the same object
     EXPECT_EQ(cg(0, 0), 9.0);    // only compiles if a const overload exists
+}
+
+TEST(GridTest, FillSetsAllCells) {
+    Grid g(3, 4);
+    g.fill(7.5);
+    for (std::size_t i = 0; i < g.rows(); ++i) {
+        for (std::size_t j = 0; j < g.cols(); ++j) {
+            EXPECT_EQ(g(i, j), 7.5);
+        }
+    }
+}
+
+TEST(GridTest, WritePgmHasValidHeaderAndSize) {
+    Grid g(4, 5);
+    g(0, 0) = 0.0;
+    g(3, 4) = 1.0;   // make sure normalization has a real range to work with
+    const std::string filename = "test_output.pgm";
+    g.write_pgm(filename);
+
+    std::ifstream in(filename, std::ios::binary);
+    ASSERT_TRUE(in.good()) << "PGM file did not open";
+
+    std::string magic;
+    int cols = 0;
+    int rows = 0;
+    int maxval = 0;
+    in >> magic >> cols >> rows >> maxval;
+
+    EXPECT_EQ(magic, "P5");
+    EXPECT_EQ(cols, 5);          // PGM is cols (width) before rows (height)
+    EXPECT_EQ(rows, 4);
+    EXPECT_EQ(maxval, 255);
+
+    in.get();                    // skip the single whitespace after maxval
+    const std::streampos header_end = in.tellg();
+    in.seekg(0, std::ios::end);
+    const std::streampos file_end = in.tellg();
+    EXPECT_EQ(static_cast<std::size_t>(file_end - header_end), 4u * 5u);
+
+    in.close();
+    std::remove(filename.c_str());
 }
