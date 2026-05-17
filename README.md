@@ -46,8 +46,8 @@ initial central hot spot.
   rank owns a contiguous block of rows plus one halo row per
   neighbor. Halos exchange via `MPI_Sendrecv` each timestep, which is
   the standard deadlock-free primitive for bidirectional pair
-  exchanges (see [JOURNAL.md](JOURNAL.md) and `projectNotes.md`
-  section 15 for the deadlock argument).
+  exchanges; separate `MPI_Send` then `MPI_Recv` can deadlock once
+  message size exceeds the runtime's eager threshold.
 * **OpenMP** within each rank: the stencil interior loop is
   parallelized with `#pragma omp parallel for collapse(2)`. No race
   conditions because each iteration writes to a unique `out(i, j)`.
@@ -70,8 +70,6 @@ benchmarks/
   plot.py            CSV -> docs/*.png
   validate.sh        hybrid vs serial byte-identity check
 docs/                committed scaling plots
-projectNotes.md      personal study notes
-JOURNAL.md           daily build journal
 ```
 
 ## Build

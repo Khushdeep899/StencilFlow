@@ -33,3 +33,8 @@ heat
 __pycache__/
 *.pyc
 .venv/
+
+# Personal dev artifacts that are intentionally not published.
+# Kept on local disk for study; should never re-enter the repo.
+projectNotes.md
+JOURNAL.md
