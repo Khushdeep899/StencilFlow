@@ -8,9 +8,9 @@ hybrid parallelism, and honest scaling measurement.
 
 ![Heat diffusing from a central hot spot](docs/diffusion.gif)
 
-256x256 grid, 1500 timesteps, four MPI ranks with OpenMP-parallel stencil
-inside each. Frames are sampled every 75 steps; total simulated wall time
-~0.2s on Apple Silicon.
+512x512 grid, 4000 timesteps, four MPI ranks with OpenMP-parallel stencil
+inside each. Frames are sampled every 200 steps; total wall time ~0.9s on
+Apple Silicon at ~1.1 billion cell-updates per second.
 
 ![Strong scaling](docs/strong_scaling.png)
 ![Weak scaling](docs/weak_scaling.png)
@@ -118,7 +118,7 @@ macOS `open frames/frame_00500.pgm` works directly in Preview.
 To regenerate the diffusion GIF shown at the top of this file:
 
 ```bash
-mpirun -n 4 ./build/stencilflow 256 256 1500 75   # produces ./frames/*.pgm
+mpirun -n 4 ./build/stencilflow 512 512 4000 200   # produces ./frames/*.pgm
 python3 benchmarks/animate.py                       # writes docs/diffusion.gif
 ```
 
