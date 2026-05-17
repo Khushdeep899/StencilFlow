@@ -17,6 +17,12 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BIN="${PROJECT_DIR}/build/stencilflow"
 MPIRUN="${MPIRUN:-/opt/homebrew/bin/mpirun}"
 
+# OpenMPI refuses to oversubscribe by default. On a CI runner with
+# only a few vCPUs, -n 4 can hit this and fail. --oversubscribe lets
+# the runtime schedule multiple ranks per core. Flag is OpenMPI-only
+# and mpich silently ignores unknown long flags after --.
+MPIRUN_FLAGS="${MPIRUN_FLAGS:---oversubscribe}"
+
 if [[ ! -x "${BIN}" ]]; then
     echo "validate: ${BIN} not found, did you build?" >&2
     exit 1
@@ -34,10 +40,16 @@ run_and_capture() {
     local n_ranks="$1"
     local out_dir="$2"
     mkdir -p "${out_dir}"
-    cd "${out_dir}"
-    "${MPIRUN}" -n "${n_ranks}" "${BIN}" "${ROWS}" "${COLS}" "${STEPS}" "${SAVE_EVERY}" \
-        > "${out_dir}/run.log" 2>&1
-    cd - > /dev/null
+    (
+        cd "${out_dir}"
+        # shellcheck disable=SC2086
+        "${MPIRUN}" ${MPIRUN_FLAGS} -n "${n_ranks}" "${BIN}" \
+            "${ROWS}" "${COLS}" "${STEPS}" "${SAVE_EVERY}"
+    ) > "${out_dir}/run.log" 2>&1 || {
+        echo "validate: mpirun -n ${n_ranks} failed; run.log:" >&2
+        cat "${out_dir}/run.log" >&2
+        exit 1
+    }
 }
 
 echo "validate: running serial (-n 1) and hybrid (-n 4)"
