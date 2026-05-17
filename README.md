@@ -6,6 +6,12 @@ Built as a focused demonstration of the patterns reservoir simulators
 use: stencil computation, 1D domain decomposition, halo exchange,
 hybrid parallelism, and honest scaling measurement.
 
+![Heat diffusing from a central hot spot](docs/diffusion.gif)
+
+256x256 grid, 1500 timesteps, four MPI ranks with OpenMP-parallel stencil
+inside each. Frames are sampled every 75 steps; total simulated wall time
+~0.2s on Apple Silicon.
+
 ![Strong scaling](docs/strong_scaling.png)
 ![Weak scaling](docs/weak_scaling.png)
 
@@ -68,8 +74,9 @@ tests/               GoogleTest unit tests for grid, stencil, decomp
 benchmarks/
   run.sh             scaling sweep -> results.csv
   plot.py            CSV -> docs/*.png
+  animate.py         PGM frames -> docs/diffusion.gif
   validate.sh        hybrid vs serial byte-identity check
-docs/                committed scaling plots
+docs/                committed scaling plots and animation GIF
 ```
 
 ## Build
@@ -105,6 +112,19 @@ mpirun -n 1 ./build/stencilflow 256 256 500
 
 PGM frames land in `frames/`. Open one with any image viewer; on
 macOS `open frames/frame_00500.pgm` works directly in Preview.
+
+## Animation
+
+To regenerate the diffusion GIF shown at the top of this file:
+
+```bash
+mpirun -n 4 ./build/stencilflow 256 256 1500 75   # produces ./frames/*.pgm
+python3 benchmarks/animate.py                       # writes docs/diffusion.gif
+```
+
+The animator applies matplotlib's perceptually uniform `inferno`
+colormap (black to purple to red to yellow) so the diffusion reads
+visually as heat.
 
 ## Test
 
