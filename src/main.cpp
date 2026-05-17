@@ -93,7 +93,10 @@ Grid gather_to_root(const Grid& u_local,
 void write_global_frame(const Grid& global, int t) {
     char fname[64];
     std::snprintf(fname, sizeof(fname), "frames/frame_%05d.pgm", t);
-    global.write_pgm(fname);
+    // Fixed [0, 100] scale anchored to the initial hot-spot value
+    // so every frame in the animation uses the same color mapping
+    // and the center is visibly seen cooling as heat spreads.
+    global.write_pgm(fname, 0.0, 100.0);
     std::printf("  step %d -> %s\n", t, fname);
     std::fflush(stdout);
 }

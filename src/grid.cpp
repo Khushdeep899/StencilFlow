@@ -16,7 +16,9 @@
 // real range can be anything (heat temperatures, etc.), so we scan for
 // min and max and linearly map to [0, 255] before writing.
 
-void Grid::write_pgm(const std::string& filename) const {
+void Grid::write_pgm(const std::string& filename,
+                     double scale_min,
+                     double scale_max) const {
     std::ofstream out(filename, std::ios::binary);
     if (!out) {
         throw std::runtime_error("Grid::write_pgm: failed to open " + filename);
@@ -28,13 +30,22 @@ void Grid::write_pgm(const std::string& filename) const {
         return;
     }
 
-    const auto [min_it, max_it] =
-        std::minmax_element(data_.begin(), data_.end());
-    const double min_val = *min_it;
-    const double range   = *max_it - min_val;
+    // If the caller did not supply a fixed scale, auto-normalize to
+    // this grid's own range. Single-snapshot mode.
+    if (scale_max <= scale_min) {
+        const auto [min_it, max_it] =
+            std::minmax_element(data_.begin(), data_.end());
+        scale_min = *min_it;
+        scale_max = *max_it;
+    }
+
+    const double range = scale_max - scale_min;
 
     for (double v : data_) {
-        const double normalized = (range > 0.0) ? (v - min_val) / range : 0.0;
+        double normalized = (range > 0.0) ? (v - scale_min) / range : 0.0;
+        // Clamp so cells outside the requested scale do not wrap.
+        if (normalized < 0.0) normalized = 0.0;
+        if (normalized > 1.0) normalized = 1.0;
         const auto byte = static_cast<unsigned char>(normalized * 255.0);
         out.put(static_cast<char>(byte));
     }

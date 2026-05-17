@@ -43,10 +43,19 @@ public:
     double*       data()       { return data_.data(); }
     const double* data() const { return data_.data(); }
 
-    // Write the grid as a P5 (binary) PGM image. Values are
-    // auto-normalized from [min, max] to [0, 255]. Implementation in
-    // grid.cpp so <fstream> stays out of headers.
-    void write_pgm(const std::string& filename) const;
+    // Write the grid as a P5 (binary) PGM image.
+    //
+    // Default behavior (scale_max <= scale_min) auto-normalizes the
+    // grid's own [min, max] range to [0, 255], which is right for a
+    // single snapshot but wrong across an animation because each
+    // frame uses a different absolute scale.
+    //
+    // For animations, pass a fixed scale (e.g. 0.0, 100.0) so every
+    // frame in the sequence shares the same color mapping. Values
+    // below scale_min clamp to 0; above scale_max clamp to 255.
+    void write_pgm(const std::string& filename,
+                   double scale_min = 0.0,
+                   double scale_max = -1.0) const;
 
 private:
     std::size_t rows_;
